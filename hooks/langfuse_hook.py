@@ -40,6 +40,7 @@ def _opt(name: str) -> str:
 
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
+AGENT_TYPE_TAGS = (_opt("CC_LANGFUSE_AGENT_TYPE_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
@@ -1510,6 +1511,37 @@ def collect_subagent_skill_tags(
                 add_skill_tags_from_rows(rows, names, "subagent-skill:")
     return names
 
+
+def collect_subagent_agent_type_tags(
+    turn: Turn,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[str]:
+    """Return 'agent:<subagent_type>' tags for every registered subagent_type
+    spawned by this turn (Agent/Task tool calls whose launch recorded an
+    agentType in the subagent's own meta.json).
+
+    Kept in a separate namespace from 'skill:'/'subagent-skill:' so a spawned
+    agent's registered identity is filterable independently of which skills
+    it happened to invoke internally. A launch with no agentType (e.g. a
+    generic/unnamed subagent_type) contributes no tag.
+    """
+    if not subagent_transcripts_by_tool_use_id:
+        return []
+    names: List[str] = []
+    for assistant_message in turn.assistant_msgs:
+        for tool_use in get_tool_use_blocks(get_content_from_row(assistant_message)):
+            tool_use_id = str(tool_use.get("id") or "")
+            subagent = subagent_transcripts_by_tool_use_id.get(tool_use_id) if tool_use_id else None
+            if not isinstance(subagent, dict):
+                continue
+            agent_type = subagent.get("agent_type")
+            if isinstance(agent_type, str) and agent_type:
+                tag = f"agent:{agent_type}"
+                if tag not in names:
+                    names.append(tag)
+    return names
+
+
 def short_session_label(session_id: str, max_len: int = 12) -> str:
     """Return a compact session label for trace names."""
     sid = session_id.strip()
@@ -1531,6 +1563,8 @@ def get_trace_tags(
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
         tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
+    if AGENT_TYPE_TAGS:
+        tags += collect_subagent_agent_type_tags(turn, subagent_transcripts_by_tool_use_id)
     return tags
 
 # ---- Generation payloads ----

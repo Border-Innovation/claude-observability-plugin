@@ -117,11 +117,13 @@ def make_agent_launch_row(tool_use_id: str) -> dict[str, Any]:
     }
 
 
-def write_subagent_transcript(tmp_path, agent_id: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+def write_subagent_transcript(
+    tmp_path, agent_id: str, rows: list[dict[str, Any]], agent_type: str | None = "general-purpose"
+) -> dict[str, Any]:
     import json as _json
     path = tmp_path / f"agent-{agent_id}.jsonl"
     path.write_text("\n".join(_json.dumps(r) for r in rows) + "\n", encoding="utf-8")
-    return {"path": path, "agent_id": agent_id, "agent_type": "general-purpose", "description": "bg"}
+    return {"path": path, "agent_id": agent_id, "agent_type": agent_type, "description": "bg"}
 
 
 def test_skills_used_inside_subagents_are_tagged_with_own_prefix(hook_module, tmp_path):
@@ -154,6 +156,7 @@ def test_subagent_skills_do_not_leak_into_main_skill_namespace(hook_module, tmp_
     assert hook_module.get_trace_tags(turns[0], sub_map) == [
         "claude-code",
         "subagent-skill:deep-research",
+        "agent:general-purpose",
     ]
 
 
@@ -171,4 +174,47 @@ def test_same_skill_across_two_subagents_is_tagged_once(hook_module, tmp_path):
 
     assert hook_module.collect_subagent_skill_tags(turns[0], sub_map) == [
         "subagent-skill:deep-research",
+    ]
+
+
+def test_agent_type_tag_uses_registered_subagent_type(hook_module, tmp_path):
+    sub_map = {"toolu_agent_1": write_subagent_transcript(tmp_path, "a1", [], agent_type="discovery-agent")}
+    turns = hook_module.build_turns([
+        make_user_row("Run discovery."),
+        make_agent_launch_row("toolu_agent_1"),
+    ])
+
+    assert hook_module.collect_subagent_agent_type_tags(turns[0], sub_map) == [
+        "agent:discovery-agent",
+    ]
+    assert hook_module.get_trace_tags(turns[0], sub_map) == [
+        "claude-code",
+        "agent:discovery-agent",
+    ]
+
+
+def test_agent_type_tag_absent_when_agent_type_missing(hook_module, tmp_path):
+    sub_map = {"toolu_agent_1": write_subagent_transcript(tmp_path, "a1", [], agent_type=None)}
+    turns = hook_module.build_turns([
+        make_user_row("Run an agent."),
+        make_agent_launch_row("toolu_agent_1"),
+    ])
+
+    assert hook_module.collect_subagent_agent_type_tags(turns[0], sub_map) == []
+    assert hook_module.get_trace_tags(turns[0], sub_map) == ["claude-code"]
+
+
+def test_same_agent_type_across_two_subagents_is_tagged_once(hook_module, tmp_path):
+    sub_map = {
+        "toolu_agent_1": write_subagent_transcript(tmp_path, "a1", [], agent_type="codegen-agent"),
+        "toolu_agent_2": write_subagent_transcript(tmp_path, "a2", [], agent_type="codegen-agent"),
+    }
+    launch = make_agent_launch_row("toolu_agent_1")
+    launch2 = make_agent_launch_row("toolu_agent_2")
+    launch2["uuid"] = "assistant-agent-2"
+    launch2["message"] = dict(launch2["message"], id="msg-agent-2")
+    turns = hook_module.build_turns([make_user_row("Run two agents."), launch, launch2])
+
+    assert hook_module.collect_subagent_agent_type_tags(turns[0], sub_map) == [
+        "agent:codegen-agent",
     ]
