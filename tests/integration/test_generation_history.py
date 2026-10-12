@@ -477,3 +477,29 @@ def test_a_tool_use_without_a_name_keeps_the_nested_shape_in_the_history(
     assert generation_inputs(fake_langfuse)[1][1]["tool_calls"] == [
         {"id": "toolu-x", "type": "function", "function": {"name": None}}
     ]
+
+
+def test_history_opt_out_sends_only_each_turns_own_input(
+    hook_module, fake_langfuse, isolated_hook_state, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(hook_module, "CAPTURE_HISTORY", False)
+    transcript = tmp_path / f"{SESSION}.jsonl"
+    rows: list[dict[str, Any]] = []
+    for index in (1, 2, 3):
+        rows.extend(simple_turn_rows(SESSION, index))
+    write_rows(transcript, rows)
+
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config_for(hook_module), SESSION, transcript
+    )
+
+    inputs = generation_inputs(fake_langfuse)
+    assert len(inputs) == 3
+    # No prior turns are repeated: turn 3 carries only its own question.
+    for index, generation_input in zip((1, 2, 3), inputs):
+        text = json.dumps(generation_input)
+        assert f"Question {index}?" in text
+        for other in (1, 2, 3):
+            if other != index:
+                assert f"Question {other}?" not in text
+                assert f"Answer {other}." not in text

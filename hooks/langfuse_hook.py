@@ -41,6 +41,12 @@ SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 AGENT_TYPE_TAGS = (_opt("CC_LANGFUSE_AGENT_TYPE_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+# Each generation's input carries the conversation so far. On a long session that is
+# quadratic in size: every LLM call repeats every earlier message, a single span batch
+# can exceed the OTLP exporter's 64 MiB request limit, and the exporter then drops the
+# whole batch (measured: 51 batches of 67-425 MB dropped re-sending one 165-turn
+# session). "false" sends each generation's own new input only, as before history.
+CAPTURE_HISTORY = (_opt("CC_LANGFUSE_CAPTURE_HISTORY") or "true").lower() == "true"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
@@ -167,6 +173,12 @@ except ValueError:
 # with no error anywhere. The hook raises the ceiling unless the user set one, and flushes
 # after every turn of a multi-turn firing so the queue never holds more than one turn.
 DEFAULT_OTEL_BSP_MAX_QUEUE_SIZE = "65536"
+
+# Spans per export request. The SDK default (512) times spans carrying up to
+# MAX_CHARS of input and output each reaches the OTLP exporter's 64 MiB request
+# limit, and an over-limit batch is dropped whole (measured: 67 MB batches dropped).
+# 128 keeps a full batch near a quarter of the limit.
+DEFAULT_LANGFUSE_FLUSH_AT = "128"
 
 @dataclass
 class LangfuseConfig:
@@ -388,6 +400,7 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
         os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
     # Read by the BatchSpanProcessor at construction, so it must be set before Langfuse().
     os.environ.setdefault("OTEL_BSP_MAX_QUEUE_SIZE", DEFAULT_OTEL_BSP_MAX_QUEUE_SIZE)
+    os.environ.setdefault("LANGFUSE_FLUSH_AT", DEFAULT_LANGFUSE_FLUSH_AT)
     try:
         return Langfuse(
             public_key=config.public_key,
@@ -1763,8 +1776,8 @@ def get_workflow_agents_in_run_dir(run_dir: Path) -> List[Dict[str, Any]]:
     """The workflow-spawned agent transcripts of one Workflow run directory.
 
     Workflow-tool agents live under <stem>/subagents/workflows/<runId>/;
-    their meta.json carries agentType=="workflow-subagent" and — unlike
-    classic subagents — no toolUseId, so a run is identified by its directory
+    their meta.json carries — unlike classic subagents — no toolUseId (agentType is
+    "workflow-subagent" only for an untyped spawn), so a run is identified by its directory
     name instead. The launching tool_use is linked via toolUseResult.runId on
     the parent transcript's tool_result row (see
     get_workflow_launch_marker_from_row).
@@ -1779,7 +1792,12 @@ def get_workflow_agents_in_run_dir(run_dir: Path) -> List[Dict[str, Any]]:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if not isinstance(metadata, dict) or metadata.get("agentType") != "workflow-subagent":
+        # A workflow agent's agentType is "workflow-subagent" only when the script
+        # spawned it untyped; a script that names an agent type (agent(..., {agentType:
+        # 'round-writer'})) records that type instead. What identifies a workflow agent
+        # is where it lives plus the absence of the classic-subagent launch link
+        # (toolUseId) and of the teammate marker (taskKind), never its type.
+        if not isinstance(metadata, dict) or metadata.get("toolUseId") or metadata.get("taskKind"):
             continue
 
         resolved = resolve_agent_jsonl_and_id(meta_path)
@@ -3497,7 +3515,7 @@ def emit_new_turns_from_transcript(
 
         # One full-file pass per firing serves every turn emitted below.
         session_history = None
-        if turns or session_state.open_turn:
+        if CAPTURE_HISTORY and (turns or session_state.open_turn):
             session_history = build_session_history(
                 transcript_path,
                 get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),

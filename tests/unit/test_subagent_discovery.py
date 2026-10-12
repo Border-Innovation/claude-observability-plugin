@@ -467,3 +467,22 @@ def test_ignores_bad_or_incomplete_subagent_metadata(hook_module, tmp_path):
     (subagent_dir / "agent-missing-tool-id.jsonl").write_text("", encoding="utf-8")
 
     assert hook_module.get_subagent_transcripts_by_tool_use_id(transcript) == {}
+
+
+def test_workflow_discovery_keeps_agents_spawned_with_a_named_agent_type(hook_module, tmp_path):
+    # A workflow script that passes agentType records that type in the meta, not
+    # "workflow-subagent"; those agents are still the run's agents.
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    run_dir = tmp_path / "transcript" / "subagents" / "workflows" / "wf_typed"
+    run_dir.mkdir(parents=True)
+    for agent_id, agent_type in (("a1", "round-writer"), ("a2", "round-runner")):
+        (run_dir / f"agent-{agent_id}.meta.json").write_text(
+            json.dumps({"agentType": agent_type, "workflowPhase": "Write", "spawnDepth": 1}),
+            encoding="utf-8",
+        )
+        (run_dir / f"agent-{agent_id}.jsonl").write_text("", encoding="utf-8")
+
+    agents = hook_module.WorkflowAgentTranscriptsByRunId(transcript).get("wf_typed")
+    assert agents is not None
+    assert sorted(agent["agent_type"] for agent in agents) == ["round-runner", "round-writer"]
