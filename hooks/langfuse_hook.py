@@ -386,6 +386,8 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
     # in span payloads on its own. The SDK reads an empty value as enabled.
     if not CAPTURE_IMAGES and not os.environ.get("LANGFUSE_MEDIA_UPLOAD_ENABLED"):
         os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
+    # Read by the BatchSpanProcessor at construction, so it must be set before Langfuse().
+    os.environ.setdefault("OTEL_BSP_MAX_QUEUE_SIZE", DEFAULT_OTEL_BSP_MAX_QUEUE_SIZE)
     try:
         return Langfuse(
             public_key=config.public_key,
@@ -2055,8 +2057,40 @@ def get_trace_tags(
     if SKILL_TAGS:
         tags += collect_skill_tags(turn)
         tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
+    if AGENT_TYPE_TAGS:
+        tags += collect_subagent_agent_type_tags(turn, subagent_transcripts_by_tool_use_id)
     tags += [tag for tag in OPERATOR_TAGS if tag not in tags]
     return tags
+
+
+def collect_subagent_agent_type_tags(
+    turn: Turn,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[str]:
+    """Return 'agent:<subagent_type>' tags for every registered subagent_type
+    spawned by this turn (Agent/Task tool calls whose launch recorded an
+    agentType in the subagent's own meta.json).
+
+    Kept in a separate namespace from 'skill:'/'subagent-skill:' so a spawned
+    agent's registered identity is filterable independently of which skills
+    it happened to invoke internally. A launch with no agentType (e.g. a
+    generic/unnamed subagent_type) contributes no tag.
+    """
+    if not subagent_transcripts_by_tool_use_id:
+        return []
+    names: List[str] = []
+    for assistant_message in turn.assistant_msgs:
+        for tool_use in get_tool_use_blocks(get_content_from_row(assistant_message)):
+            tool_use_id = str(tool_use.get("id") or "")
+            subagent = subagent_transcripts_by_tool_use_id.get(tool_use_id) if tool_use_id else None
+            if not isinstance(subagent, dict):
+                continue
+            agent_type = subagent.get("agent_type")
+            if isinstance(agent_type, str) and agent_type:
+                tag = f"agent:{agent_type}"
+                if tag not in names:
+                    names.append(tag)
+    return names
 
 # ---- Generation payloads ----
 def build_generation_input(
