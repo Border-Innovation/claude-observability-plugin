@@ -50,6 +50,20 @@ except ValueError:
 # Bound for unresolved task notifications kept in the state file between runs.
 MAX_PENDING_TASK_NOTIFICATIONS = 50
 
+# How long the final flush+shutdown may take before the hook gives up on it.
+try:
+    FLUSH_TIMEOUT_S = float(_opt("CC_LANGFUSE_FLUSH_TIMEOUT_S") or "5")
+except ValueError:
+    FLUSH_TIMEOUT_S = 5.0
+
+# OpenTelemetry's BatchSpanProcessor buffers spans in a deque(maxlen=OTEL_BSP_MAX_QUEUE_SIZE),
+# default 2048, and appends to the left: once full, every new span silently evicts the oldest
+# one. A single firing that emits a backlog (first run on a long session, or a run after the
+# hook was not loaded) produces far more than 2048 spans in seconds, so whole turns vanished
+# with no error anywhere. The hook raises the ceiling unless the user set one, and flushes
+# after every turn of a multi-turn firing so the queue never holds more than one turn.
+DEFAULT_OTEL_BSP_MAX_QUEUE_SIZE = "65536"
+
 @dataclass
 class LangfuseConfig:
     public_key: str
@@ -232,6 +246,8 @@ except Exception as e:
     sys.exit(0)
 
 def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
+    # Read by the BatchSpanProcessor at construction, so it must be set before Langfuse().
+    os.environ.setdefault("OTEL_BSP_MAX_QUEUE_SIZE", DEFAULT_OTEL_BSP_MAX_QUEUE_SIZE)
     try:
         return Langfuse(
             public_key=config.public_key,
@@ -2510,7 +2526,21 @@ def emit_and_close_ready_turns(
             # Log at INFO so SDK incompatibilities (and other emit failures)
             # are visible without needing CC_LANGFUSE_DEBUG=true.
             info(f"emit_turn failed: {type(e).__name__}: {e}")
+        if len(turns_to_emit) > 1:
+            # Backlog firing: export this turn before building the next one, so the
+            # span queue never overflows (see DEFAULT_OTEL_BSP_MAX_QUEUE_SIZE).
+            flush_langfuse_client(langfuse)
     return emitted
+
+
+def flush_langfuse_client(langfuse: Any) -> None:
+    flush = getattr(langfuse, "flush", None)
+    if not callable(flush):
+        return
+    try:
+        flush()
+    except Exception as e:
+        info(f"langfuse flush failed: {type(e).__name__}: {e}")
 
 
 def emit_ready_observations_of_open_turn(
@@ -2645,7 +2675,8 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
     if langfuse is None:
         return
 
-    # Cap flush+shutdown at 5s so a slow/unreachable Langfuse can't stall Claude Code.
+    # Cap flush+shutdown (default 5s, CC_LANGFUSE_FLUSH_TIMEOUT_S) so a slow/unreachable
+    # Langfuse can't stall Claude Code.
     try:
         def _flush_and_shutdown():
             try:
@@ -2656,7 +2687,7 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
 
         t = threading.Thread(target=_flush_and_shutdown, daemon=True)
         t.start()
-        t.join(5.0)
+        t.join(FLUSH_TIMEOUT_S)
     except Exception:
         pass
 
