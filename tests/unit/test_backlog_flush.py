@@ -62,3 +62,18 @@ def test_client_creation_keeps_user_queue_ceiling(hook_module: Any, monkeypatch:
     hook_module.create_langfuse_client(config)
     import os
     assert os.environ["OTEL_BSP_MAX_QUEUE_SIZE"] == "123"
+
+
+def test_client_creation_caps_spans_per_export_request(hook_module: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LANGFUSE_FLUSH_AT", raising=False)
+    seen: dict[str, Any] = {}
+
+    class RecordingLangfuse:
+        def __init__(self, **_: Any) -> None:
+            import os
+            seen["flush_at"] = os.environ.get("LANGFUSE_FLUSH_AT")
+
+    monkeypatch.setattr(hook_module, "Langfuse", RecordingLangfuse)
+    config = hook_module.LangfuseConfig(public_key="pk", secret_key="sk", host="h", user_id=None)
+    hook_module.create_langfuse_client(config)
+    assert seen["flush_at"] == hook_module.DEFAULT_LANGFUSE_FLUSH_AT

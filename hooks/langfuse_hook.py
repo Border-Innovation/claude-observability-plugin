@@ -174,6 +174,12 @@ except ValueError:
 # after every turn of a multi-turn firing so the queue never holds more than one turn.
 DEFAULT_OTEL_BSP_MAX_QUEUE_SIZE = "65536"
 
+# Spans per export request. The SDK default (512) times spans carrying up to
+# MAX_CHARS of input and output each reaches the OTLP exporter's 64 MiB request
+# limit, and an over-limit batch is dropped whole (measured: 67 MB batches dropped).
+# 128 keeps a full batch near a quarter of the limit.
+DEFAULT_LANGFUSE_FLUSH_AT = "128"
+
 @dataclass
 class LangfuseConfig:
     public_key: str
@@ -394,6 +400,7 @@ def create_langfuse_client(config: LangfuseConfig) -> Optional[Langfuse]:
         os.environ["LANGFUSE_MEDIA_UPLOAD_ENABLED"] = "false"
     # Read by the BatchSpanProcessor at construction, so it must be set before Langfuse().
     os.environ.setdefault("OTEL_BSP_MAX_QUEUE_SIZE", DEFAULT_OTEL_BSP_MAX_QUEUE_SIZE)
+    os.environ.setdefault("LANGFUSE_FLUSH_AT", DEFAULT_LANGFUSE_FLUSH_AT)
     try:
         return Langfuse(
             public_key=config.public_key,
