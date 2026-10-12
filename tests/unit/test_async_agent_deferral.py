@@ -490,6 +490,82 @@ def test_launch_text_fallback_defers_rows_without_tool_use_result(hook_module):
     assert len(state.pending_agent_turns) == 1
 
 
+def workflow_launch_turn_rows(
+    tool_use_id: str = "toolu_wf",
+    run_id: str = "wf_run1",
+) -> list[dict[str, Any]]:
+    return [
+        make_user_row("user-1", "Run the workflow.", "2026-01-01T00:00:00.000Z"),
+        make_assistant_row(
+            "assistant-1",
+            "msg-1",
+            [{"type": "tool_use", "id": tool_use_id, "name": "Workflow",
+              "input": {"script": "await parallel([() => agent('x')])"}}],
+            "2026-01-01T00:00:01.000Z",
+        ),
+        make_agent_result_row(
+            "tool-result-1",
+            tool_use_id,
+            "Workflow launched in background. Task ID: t1",
+            "2026-01-01T00:00:02.000Z",
+            tool_use_result={
+                "status": "async_launched",
+                "taskId": "t1",
+                "taskType": "local_workflow",
+                "workflowName": "wf-name",
+                "runId": run_id,
+            },
+        ),
+        make_assistant_row(
+            "assistant-2",
+            "msg-2",
+            [{"type": "text", "text": "The workflow is running in the background."}],
+            "2026-01-01T00:00:03.000Z",
+        ),
+    ]
+
+
+def test_running_workflow_defers_the_turn_until_notification(hook_module):
+    turns = hook_module.build_turns(workflow_launch_turn_rows())
+    state = hook_module.SessionState()
+
+    turns_to_emit = hook_module.get_turns_to_emit(turns, state)
+
+    assert turns_to_emit == []
+    assert len(state.pending_agent_turns) == 1
+    assert state.pending_agent_turns[0]["pending_tool_use_ids"] == ["toolu_wf"]
+
+
+def test_workflow_turn_resolves_via_embedded_tool_use_id_notification(hook_module):
+    rows = workflow_launch_turn_rows() + [
+        make_notification_row("notif-1", "toolu_wf", "workflow done", "2026-01-01T00:02:00.000Z"),
+    ]
+    turns = hook_module.build_turns(rows)
+    state = hook_module.SessionState()
+
+    turns_to_emit = hook_module.get_turns_to_emit(turns, state)
+
+    assert len(turns_to_emit) == 1
+    assert state.pending_agent_turns == []
+    entry = turns_to_emit[0].tool_results_by_id["toolu_wf"]
+    assert entry["final_content"] == "workflow done"
+    # The run id linking emission to the workflow's agent transcripts comes
+    # from the structured toolUseResult, recorded at turn assembly.
+    assert entry["workflow_run_id"] == "wf_run1"
+    assert entry["workflow_name"] == "wf-name"
+
+
+def test_workflow_link_requires_structured_tool_use_result(hook_module):
+    # Without toolUseResult (older Claude Code) the launch text is NEVER
+    # parsed for a run id; the entry simply carries no workflow link.
+    rows = workflow_launch_turn_rows()
+    rows[2].pop("toolUseResult")
+    turns = hook_module.build_turns(rows)
+
+    entry = turns[0].tool_results_by_id["toolu_wf"]
+    assert "workflow_run_id" not in entry
+
+
 def make_task_id_notification_row(uuid: str, task_id: str, result: str, timestamp: str) -> dict[str, Any]:
     return {
         "type": "user",

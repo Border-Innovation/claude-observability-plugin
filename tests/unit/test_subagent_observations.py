@@ -30,7 +30,7 @@ def test_subagent_observations_skip_malformed_jsonl_lines(
     assert end_timestamp.isoformat() == "2026-01-01T00:02:04.500000+00:00"
     assert [observation.name for observation in fake_langfuse.observations] == [
         "Subagent: Summarize docs",
-        "Subagent LLM Call 1",
+        "Subagent LLM Call",
         "Tool: ToolSearch",
-        "Subagent LLM Call 2",
+        "Subagent LLM Call",
     ]

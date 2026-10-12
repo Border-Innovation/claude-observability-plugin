@@ -140,6 +140,91 @@ def test_open_agent_turn_emits_only_after_notification_delivery(
     assert len(roots()) == 1
 
 
+def test_named_teammate_transcript_attaches_to_its_launch_at_session_end_flush(
+    hook_module,
+    fake_langfuse,
+    isolated_hook_state,
+    tmp_path,
+):
+    """A teammate meta has no toolUseId. The launch input.name
+    attributes its transcript when the deferred turn flushes at SessionEnd."""
+    transcript = tmp_path / "transcript.jsonl"
+    subagent_dir = tmp_path / "transcript" / "subagents"
+    subagent_dir.mkdir(parents=True)
+    # Meta and launch shapes below are harvested from a real 2.1.238 team session.
+    (subagent_dir / "agent-abuilder-issue-4-03b96faf.meta.json").write_text(
+        json.dumps({
+            "agentType": "builder-issue-4",
+            "description": "Build issue 4",
+            "name": "builder-issue-4",
+            "spawnDepth": 0,
+            "model": "sonnet",
+            "taskKind": "in_process_teammate",
+            "teamName": "session-test",
+            "color": "blue",
+            "planModeRequired": False,
+            "permissionMode": "default",
+        }),
+        encoding="utf-8",
+    )
+    (subagent_dir / "agent-abuilder-issue-4-03b96faf.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in [
+            {"type": "user", "uuid": "builder-user-1", "timestamp": "2026-01-01T00:00:03.000Z",
+             "message": {"role": "user", "content": "Build the fix."}},
+            {"type": "assistant", "uuid": "builder-assistant-1", "timestamp": "2026-01-01T00:00:06.000Z",
+             "message": {"id": "msg-builder-1", "role": "assistant", "model": "claude-test",
+                         "content": [{"type": "text", "text": "Patch ready."}],
+                         "usage": {"input_tokens": 12, "output_tokens": 34}}},
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    launch_rows = [
+        {"type": "user", "uuid": "user-1", "timestamp": "2026-01-01T00:00:00.000Z",
+         "sessionId": "session-teammate", "message": {"role": "user", "content": "Start a teammate."}},
+        {"type": "assistant", "uuid": "assistant-1", "timestamp": "2026-01-01T00:00:01.000Z",
+         "message": {"id": "msg-1", "role": "assistant", "model": "claude-test",
+                     "content": [{"type": "tool_use", "id": "toolu_builder", "name": "Agent",
+                                  "input": {"name": "builder-issue-4",
+                                            "taskKind": "in_process_teammate",
+                                            "prompt": "Build the fix."}}]}},
+        {"type": "user", "uuid": "tool-result-1", "timestamp": "2026-01-01T00:00:02.000Z",
+         "toolUseResult": {"status": "teammate_spawned", "name": "builder-issue-4",
+                           "agent_id": "builder-issue-4@session-test",
+                           "teammate_id": "builder-issue-4@session-test",
+                           "agent_type": "general-purpose", "team_name": "session-test"},
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_builder",
+              "content": [{"type": "text", "text": "Spawned successfully. agent_id: builder-issue-4@session-test"}]}]}},
+        {"type": "assistant", "uuid": "assistant-2", "timestamp": "2026-01-01T00:00:02.500Z",
+         "message": {"id": "msg-2", "role": "assistant", "model": "claude-test",
+                     "content": [{"type": "text", "text": "The teammate is running."}]}},
+    ]
+    transcript.write_text("\n".join(json.dumps(row) for row in launch_rows) + "\n", encoding="utf-8")
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+
+    # First Stop: a teammate sends no task-notification. The hook emits nothing.
+    hook_module.emit_new_turns_from_transcript(fake_langfuse, config, "session-teammate", transcript)
+    assert fake_langfuse.observations == []
+
+    # SessionEnd: the hook flushes the deferred turn with the teammate transcript.
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config, "session-teammate", transcript, flush_deferred_agent_turns=True,
+    )
+
+    names = [observation.name for observation in fake_langfuse.observations]
+    assert "Conversational Turn" in names
+    assert "Tool: Agent" in names
+    assert "Subagent: Build issue 4" in names
+    teammate_span = next(o for o in fake_langfuse.observations if o.name == "Subagent: Build issue 4")
+    # Real teammate metas set agentType to the teammate name (config/launch
+    # result say "general-purpose"; the meta does not).
+    assert teammate_span.kwargs["metadata"]["agent_type"] == "builder-issue-4"
+    assert teammate_span.output == {"role": "assistant", "content": "Patch ready."}
+    # The trace contains the teammate tokens. 
+    teammate_generation = next(o for o in fake_langfuse.observations if o.name == "Subagent LLM Call")
+    assert teammate_generation.kwargs["usage_details"] == {"input": 12, "output": 34}
+
+
 def test_only_the_turn_root_span_is_marked_as_root(
     hook_module,
     fixture_transcript_path,
