@@ -41,6 +41,12 @@ SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 AGENT_TYPE_TAGS = (_opt("CC_LANGFUSE_AGENT_TYPE_TAGS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
+# Each generation's input carries the conversation so far. On a long session that is
+# quadratic in size: every LLM call repeats every earlier message, a single span batch
+# can exceed the OTLP exporter's 64 MiB request limit, and the exporter then drops the
+# whole batch (measured: 51 batches of 67-425 MB dropped re-sending one 165-turn
+# session). "false" sends each generation's own new input only, as before history.
+CAPTURE_HISTORY = (_opt("CC_LANGFUSE_CAPTURE_HISTORY") or "true").lower() == "true"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
@@ -3497,7 +3503,7 @@ def emit_new_turns_from_transcript(
 
         # One full-file pass per firing serves every turn emitted below.
         session_history = None
-        if turns or session_state.open_turn:
+        if CAPTURE_HISTORY and (turns or session_state.open_turn):
             session_history = build_session_history(
                 transcript_path,
                 get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),

@@ -61,6 +61,12 @@
       "description": "Upload images to Langfuse and show them in the trace. This includes pasted images and screenshots from tool results. Your Langfuse deployment must support media upload. Set to false to show short text markers instead.",
       "default": true
     },
+    "CC_LANGFUSE_CAPTURE_HISTORY": {
+      "type": "boolean",
+      "title": "Capture conversation history",
+      "description": "Send the conversation so far as each LLM call's input. On long sessions this grows quadratically and span batches can exceed the exporter's 64 MiB limit, which drops them. Set to false to send each call's own new input only.",
+      "default": true
+    },
     "CC_LANGFUSE_STATE_DIR": {
       "type": "string",
       "title": "State directory",
