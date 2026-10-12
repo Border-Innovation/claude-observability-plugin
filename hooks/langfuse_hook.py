@@ -1769,8 +1769,8 @@ def get_workflow_agents_in_run_dir(run_dir: Path) -> List[Dict[str, Any]]:
     """The workflow-spawned agent transcripts of one Workflow run directory.
 
     Workflow-tool agents live under <stem>/subagents/workflows/<runId>/;
-    their meta.json carries agentType=="workflow-subagent" and — unlike
-    classic subagents — no toolUseId, so a run is identified by its directory
+    their meta.json carries — unlike classic subagents — no toolUseId (agentType is
+    "workflow-subagent" only for an untyped spawn), so a run is identified by its directory
     name instead. The launching tool_use is linked via toolUseResult.runId on
     the parent transcript's tool_result row (see
     get_workflow_launch_marker_from_row).
@@ -1785,7 +1785,12 @@ def get_workflow_agents_in_run_dir(run_dir: Path) -> List[Dict[str, Any]]:
             metadata = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             continue
-        if not isinstance(metadata, dict) or metadata.get("agentType") != "workflow-subagent":
+        # A workflow agent's agentType is "workflow-subagent" only when the script
+        # spawned it untyped; a script that names an agent type (agent(..., {agentType:
+        # 'round-writer'})) records that type instead. What identifies a workflow agent
+        # is where it lives plus the absence of the classic-subagent launch link
+        # (toolUseId) and of the teammate marker (taskKind), never its type.
+        if not isinstance(metadata, dict) or metadata.get("toolUseId") or metadata.get("taskKind"):
             continue
 
         resolved = resolve_agent_jsonl_and_id(meta_path)
