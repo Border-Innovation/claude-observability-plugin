@@ -1,0 +1,5 @@
+{"type":"started","key":"v2:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","agentId":"r1"}
+{"type":"started","key":"v2:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2","agentId":"r2"}
+{"type":"started","key":"v2:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3","agentId":"r3"}
+{"type":"result","key":"v2:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1","agentId":"r1","result":{"verdict":"claim A holds","confidence":"high"}}
+{"type":"result","key":"v2:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2","agentId":"r2","result":{"verdict":"claim B holds","confidence":"high"}}

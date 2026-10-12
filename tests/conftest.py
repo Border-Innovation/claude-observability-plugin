@@ -6,6 +6,7 @@ import itertools
 import importlib.util
 import json
 import logging
+import os
 import sys
 import types
 from pathlib import Path
@@ -16,6 +17,18 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = REPO_ROOT / "tests" / "fixtures" / "transcripts"
+
+# Remove developer environment values that would leak into the hook's
+# import-time config. Tests that need these variables set them per test.
+os.environ.pop("CC_LANGFUSE_STATE_DIR", None)
+os.environ.pop("CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_STATE_DIR", None)
+os.environ.pop("CC_LANGFUSE_CAPTURE_IMAGES", None)
+os.environ.pop("CLAUDE_PLUGIN_OPTION_CC_LANGFUSE_CAPTURE_IMAGES", None)
+
+# Mirrors OTel's active-span context: the stubbed use_span pushes the parent
+# span here so FakeOtelSpan can record which span it was started under,
+# letting tests assert observation nesting.
+_ACTIVE_SPAN_STACK: list[Any] = []
 
 
 def _install_langfuse_stubs() -> None:
@@ -37,12 +50,38 @@ def _install_langfuse_stubs() -> None:
     langfuse_module.propagate_attributes = propagate_attributes
     sys.modules["langfuse"] = langfuse_module
 
+    media_module = types.ModuleType("langfuse.media")
+
+    class LangfuseMedia:
+        # Keyword-only with the real SDK constructor's parameters, so
+        # signature drift in the hook fails the tests, not production.
+        def __init__(
+            self,
+            *,
+            obj: Any = None,
+            base64_data_uri: str | None = None,
+            content_type: str | None = None,
+            content_bytes: bytes | None = None,
+            file_path: str | None = None,
+        ) -> None:
+            self.base64_data_uri = base64_data_uri
+            self.content_type = content_type
+            self.content_bytes = content_bytes
+
+    media_module.LangfuseMedia = LangfuseMedia
+    langfuse_module.media = media_module
+    sys.modules["langfuse.media"] = media_module
+
     opentelemetry_module = types.ModuleType("opentelemetry")
     trace_module = types.ModuleType("opentelemetry.trace")
 
     @contextlib.contextmanager
-    def use_span(*_: Any, **__: Any) -> Iterator[None]:
-        yield
+    def use_span(span: Any = None, *_: Any, **__: Any) -> Iterator[None]:
+        _ACTIVE_SPAN_STACK.append(span)
+        try:
+            yield
+        finally:
+            _ACTIVE_SPAN_STACK.pop()
 
     class TraceFlags(int):
         SAMPLED = 0x01
@@ -110,6 +149,9 @@ class FakeOtelSpan:
         self.start_time = start_time
         self.context = context
         self.attributes: dict[str, Any] = {}
+        # The span this one was started under (via the stubbed use_span);
+        # None for roots and carrier-context spans.
+        self.parent = _ACTIVE_SPAN_STACK[-1] if _ACTIVE_SPAN_STACK else None
 
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value

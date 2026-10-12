@@ -146,7 +146,8 @@ def test_attached_mode_does_not_propagate_trace_level_attributes(
         fake_langfuse, standalone, "session-standalone", write_two_turn_transcript(standalone_dir)
     )
     assert calls
-    assert all("trace_name" in call for call in calls)
+    assert all(call.get("trace_name") == "Claude Code Turn" for call in calls)
+    assert all(call.get("session_id") == "session-standalone" for call in calls)
 
 
 def test_attached_open_turn_resumes_without_reopening_its_root(

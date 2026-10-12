@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from typing import Any
 
@@ -128,3 +129,26 @@ def test_client_creation_failure_is_logged(hook_module: Any, monkeypatch: pytest
     log = _read_log(hook_module)
     assert "Langfuse client creation failed" in log
     assert "RuntimeError" in log
+
+
+# ----------------- the reason reaches the log through main() -----------------
+
+def test_main_logs_incomplete_config_without_debug(
+    hook_module: Any, clean_key_env: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Covers the call path, not only the function: main() must log the reason.
+
+    The tests above call log_missing_langfuse_config() directly, so they stay
+    green even when main() stops calling it and users get silence.
+    """
+    monkeypatch.setattr(hook_module, "DEBUG", False)
+    monkeypatch.setattr("sys.stdin", io.StringIO("{}"))
+
+    assert hook_module.main() == 0
+
+    # Read tolerantly: without the call, no line is written and the log file is
+    # absent, which must fail as a readable assertion, not as a file error.
+    log_file = Path(hook_module.LOG_FILE)
+    log = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+    assert "[INFO]" in log, "main() wrote no log line: the reason stays invisible"
+    assert "Langfuse config incomplete" in log

@@ -1,7 +1,7 @@
 {
   "name": "langfuse-observability",
   "description": "The Langfuse x Claude Code Observability Plugin",
-  "version": "1.0.0",
+  "version": "1.2.1",
   "author": {
     "name": "Langfuse"
   },
@@ -13,20 +13,18 @@
       "type": "string",
       "title": "Langfuse Secret Key",
       "description": "Your Langfuse project secret key (sk-lf-...)",
-      "sensitive": true,
-      "required": true
+      "sensitive": true
     },
     "LANGFUSE_PUBLIC_KEY": {
       "type": "string",
       "title": "Langfuse Public Key",
-      "description": "Your Langfuse project public key (pk-lf-...)",
-      "required": true
+      "description": "Your Langfuse project public key (pk-lf-...)"
     },
     "LANGFUSE_BASE_URL": {
       "type": "string",
       "title": "Langfuse Base URL",
       "description": "Langfuse host. Use https://us.cloud.langfuse.com for US, https://cloud.langfuse.com for EU, or your self-hosted URL.",
-      "default": "https://us.cloud.langfuse.com"
+      "default": "https://cloud.langfuse.com"
     },
     "LANGFUSE_USER_ID": {
       "type": "string",
@@ -56,6 +54,17 @@
       "title": "Capture skill instructions",
       "description": "Include the injected skill instruction text in the Skill tool span output",
       "default": false
+    },
+    "CC_LANGFUSE_CAPTURE_IMAGES": {
+      "type": "boolean",
+      "title": "Capture images",
+      "description": "Upload images to Langfuse and show them in the trace. This includes pasted images and screenshots from tool results. Your Langfuse deployment must support media upload. Set to false to show short text markers instead.",
+      "default": true
+    },
+    "CC_LANGFUSE_STATE_DIR": {
+      "type": "string",
+      "title": "State directory",
+      "description": "Optional. Absolute directory for the hook's state, lock and log files (default ~/.claude/state). Set a distinct value per CLAUDE_CONFIG_DIR installation to keep their state separate. Leave empty for the default."
     },
     "CC_LANGFUSE_TRACE_SEED": {
       "type": "string",
