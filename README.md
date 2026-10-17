@@ -71,6 +71,25 @@ claude plugin update langfuse-observability@langfuse-observability
 Restart Claude Code afterwards. `claude plugin list` shows the installed
 version.
 
+## Backfilling a past session
+
+The hook can re-upload a finished session from its transcript, for example
+to repair traces a version with a known gap exported incompletely. Run it
+only after the session has ended.
+
+```bash
+uv run --script hooks/langfuse_hook.py \
+  --backfill ~/.claude/projects/<project>/<session-id>.jsonl --dry-run
+```
+
+`--dry-run` builds every observation, sends nothing, and prints the counts
+and token totals that would be exported. Without it, the same Langfuse keys as
+the hook are read from the environment. The re-uploaded turns go to traces
+of their own (`--namespace`, default `backfill-v1`) with deterministic
+observation ids, so a second run replaces the first. Add
+`--replace-session-traces` to delete the session's other traces, the ones a
+live hook exported before, so the session is not counted twice.
+
 ## Troubleshooting
 
 The hook explains nearly every failure in

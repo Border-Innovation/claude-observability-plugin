@@ -12,6 +12,7 @@ Claude Code -> Langfuse hook
 
 import base64
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -47,6 +48,11 @@ CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true
 # whole batch (measured: 51 batches of 67-425 MB dropped re-sending one 165-turn
 # session). "false" sends each generation's own new input only, as before history.
 CAPTURE_HISTORY = (_opt("CC_LANGFUSE_CAPTURE_HISTORY") or "true").lower() == "true"
+# Observation ids derived from the trace id plus a stable key (message id,
+# tool_use id, agent id) instead of random ones, so a re-emitted observation
+# (a resumed agent, a backfill re-run, a replay after a crash) overwrites its
+# earlier copy instead of adding a second one.
+DETERMINISTIC_IDS = (_opt("CC_LANGFUSE_DETERMINISTIC_IDS") or "true").lower() == "true"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
@@ -624,6 +630,19 @@ def sweep_stale_session_locks(state: Dict[str, Any], cutoff: datetime) -> None:
                 lock.unlink()
         except OSError:
             pass
+    try:
+        registries = list(STATE_DIR.glob("langfuse_agents.*.json"))
+    except OSError:
+        return
+    for registry in registries:
+        stem = registry.name[len("langfuse_agents."):-len(".json")]
+        if len(stem) != 16 or stem in live:
+            continue
+        try:
+            if registry.stat().st_mtime < cutoff.timestamp():
+                registry.unlink()
+        except OSError:
+            pass
 
 
 def save_hook_state(state: Dict[str, Any]) -> None:
@@ -665,12 +684,32 @@ def get_content_from_row(row: Dict[str, Any]) -> Any:
         return message.get("content")
     return row.get("content")
 
+# Row types that echo the API request Claude Code sent (since 2.1.301): a
+# request record, its system/shape, and one "blob" per request message. A blob
+# carries message.role "user"/"assistant" with neither id, usage nor timestamp,
+# so read as a chat row it starts phantom turns and zero-usage generations.
+REQUEST_ECHO_ROW_TYPE_PREFIX = "api-request"
+
+def is_request_echo_row(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    row_type = row.get("type")
+    return isinstance(row_type, str) and row_type.startswith(REQUEST_ECHO_ROW_TYPE_PREFIX)
+
+def drop_request_echo_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [row for row in rows if not is_request_echo_row(row)]
+
 def get_user_or_assistant_role_from_row(row: Dict[str, Any]) -> Optional[str]:
     # Claude Code transcript row format is internal. Prefer top-level row.type
     # when it marks a chat row, then fall back to nested message.role.
     row_type = row.get("type")
     if row_type in ("user", "assistant"):
         return row_type
+    if isinstance(row_type, str) and row_type:
+        # A typed row of any other kind (attachment, queue-operation,
+        # api-request-blob, ...) is never a chat message, even when it embeds
+        # one; only untyped rows from older formats fall back to message.role.
+        return None
 
     message = row.get("message")
     if isinstance(message, dict):
@@ -942,7 +981,7 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
         except Exception:
             continue
 
-    return msgs, session_state
+    return drop_request_echo_rows(msgs), session_state
 
 
 # ----------------- Turn assembly -----------------
@@ -980,6 +1019,9 @@ def _extract_xml_tag_value(text: str, tag: str) -> Optional[str]:
     return text[i + len(start):j]
 
 def is_task_notification_row(row: Dict[str, Any]) -> bool:
+    if is_request_echo_row(row):
+        # A request blob repeats a delivered notification without its timestamp.
+        return False
     origin = row.get("origin")
     if isinstance(origin, dict) and origin.get("kind") == "task-notification":
         return True
@@ -1210,6 +1252,13 @@ def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[
     Queue remove rows carry no notification content and cannot be matched, so
     a removed notification keeps the gate closed until the turn ends — the
     safe direction (close-time emission is always correct).
+
+    Newer Claude Code versions do write the notification content on the
+    remove row. A notification for an agent launched BY a subagent is
+    enqueued on the main queue and removed at once (it is routed to that
+    subagent and never delivered here), so a remove row carrying the id
+    takes its entry off the queue; otherwise such a notification would
+    hold the main turn closed until it ends.
     """
     queued: List[str] = []
     delivered = set()
@@ -1220,6 +1269,10 @@ def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[
         if not tool_use_id:
             continue
         if row.get("type") == "queue-operation":
+            if row.get("operation") == "remove":
+                if tool_use_id in queued:
+                    queued.remove(tool_use_id)
+                continue
             queued.append(tool_use_id)
         else:
             delivered.add(tool_use_id)
@@ -1681,7 +1734,7 @@ def get_agent_launch_tool_use_ids_by_name(transcript_path: Path) -> Dict[str, st
                     row = json.loads(line)
                 except Exception:
                     continue
-                if not isinstance(row, dict):
+                if not isinstance(row, dict) or is_request_echo_row(row):
                     continue
                 for tool_use in get_tool_use_blocks(get_content_from_row(row)):
                     tool_use_id = str(tool_use.get("id") or "")
@@ -1753,7 +1806,7 @@ def get_workflow_journal_results(run_dir: Path) -> Dict[str, Any]:
     one per completed agent; unparseable lines are skipped."""
     journal_path = run_dir / "journal.jsonl"
     try:
-        lines = journal_path.read_text(encoding="utf-8").splitlines()
+        lines = split_jsonl_lines(journal_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
     results_by_agent_id: Dict[str, Any] = {}
@@ -1942,6 +1995,109 @@ def _build_forced_trace_context(trace_id_hex: str,
         debug(f"forced trace context for {trace_id_hex!r} failed: {e}")
         return None
 
+class DeterministicSpanIdGenerator:
+    """Wraps the tracer's OTel id generator: the next span id can be preset
+    (one shot); everything else is delegated to the wrapped generator."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.next_span_id: Optional[int] = None
+
+    def generate_span_id(self) -> int:
+        span_id, self.next_span_id = self.next_span_id, None
+        return span_id if span_id else self._inner.generate_span_id()
+
+    def generate_trace_id(self) -> int:
+        return self._inner.generate_trace_id()
+
+    def is_trace_id_random(self) -> bool:
+        is_random = getattr(self._inner, "is_trace_id_random", None)
+        return bool(is_random()) if callable(is_random) else True
+
+
+def install_deterministic_span_ids(langfuse: Any) -> Optional[DeterministicSpanIdGenerator]:
+    """Wrap the tracer's id generator once. Returns None (random ids stay)
+    when deterministic ids are off or the tracer exposes no id_generator
+    (a no-op tracer, an SDK that changed its internals)."""
+    if not DETERMINISTIC_IDS:
+        return None
+    tracer = getattr(langfuse, "_otel_tracer", None)
+    inner = getattr(tracer, "id_generator", None)
+    if inner is None:
+        return None
+    if isinstance(inner, DeterministicSpanIdGenerator):
+        return inner
+    try:
+        wrapper = DeterministicSpanIdGenerator(inner)
+        tracer.id_generator = wrapper
+        return wrapper
+    except Exception as e:
+        debug(f"deterministic span ids unavailable: {e}")
+        return None
+
+
+# Scope for observations without a natural id (an assistant message with no
+# message.id): their keys are positional, so the scope (agent id + turn
+# index) keeps two turns of one agent trace from deriving the same id.
+_ID_SCOPE: "contextvars.ContextVar[str]" = contextvars.ContextVar("cc_langfuse_id_scope", default="")
+
+
+@contextlib.contextmanager
+def id_scope(scope: str) -> Any:
+    token = _ID_SCOPE.set(scope)
+    try:
+        yield
+    finally:
+        _ID_SCOPE.reset(token)
+
+
+def derive_span_id(trace_id_hex: str, id_key: str) -> int:
+    """sha256(trace id + key)[:8 bytes] as a non-zero 64-bit span id."""
+    scope = _ID_SCOPE.get() if "noid:" in id_key else ""
+    seed = f"{trace_id_hex}:{scope}:{id_key}" if scope else f"{trace_id_hex}:{id_key}"
+    return int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16], 16) or 1
+
+
+def get_trace_id_hex_for_new_span(parent_otel_span: Any, forced_trace_id: Optional[str]) -> Optional[str]:
+    try:
+        if parent_otel_span is not None:
+            trace_id = parent_otel_span.get_span_context().trace_id
+            return f"{trace_id:032x}" if trace_id else None
+    except Exception:
+        return None
+    if forced_trace_id and _is_valid_trace_id_hex(forced_trace_id):
+        return forced_trace_id.lower()
+    return None
+
+
+def get_span_context_hex(otel_span: Any) -> Optional[Tuple[str, str]]:
+    """(trace id, span id) of an OTel span as hex, or None."""
+    try:
+        context = otel_span.get_span_context()
+        if not context.trace_id or not context.span_id:
+            return None
+        return f"{context.trace_id:032x}", f"{context.span_id:016x}"
+    except Exception:
+        return None
+
+
+def carrier_span(trace_id_hex: str, span_id_hex: str) -> Optional[Any]:
+    """A non-exporting stand-in for an already exported span, so children
+    emitted by a later firing nest under it."""
+    if not _is_valid_trace_id_hex(trace_id_hex) or not is_valid_span_id_hex(span_id_hex):
+        return None
+    try:
+        return otel_trace_api.NonRecordingSpan(otel_trace_api.SpanContext(
+            trace_id=int(trace_id_hex, 16),
+            span_id=int(span_id_hex, 16),
+            is_remote=False,
+            trace_flags=otel_trace_api.TraceFlags(0x01),
+        ))
+    except Exception as e:
+        debug(f"carrier span failed: {e}")
+        return None
+
+
 def _start_root_otel_span(langfuse: Langfuse, name: str, start_ns: Optional[int],
                           forced_trace_id: Optional[str],
                           forced_parent_span_id: Optional[str] = None) -> Any:
@@ -1960,8 +2116,12 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
                      as_root: bool = False,
                      forced_trace_id: Optional[str] = None,
                      forced_parent_span_id: Optional[str] = None,
+                     id_key: Optional[str] = None,
                      **obs_kwargs: Any) -> Any:
     """Create a Langfuse observation with an explicit OTel start_time.
+
+    With id_key set (and deterministic ids on), the observation id is
+    derive_span_id(trace id, id_key) rather than random.
 
     Bypasses langfuse.start_observation() (which has no start_time kwarg in
     SDK 4.x) by talking to the underlying OTel tracer directly and then
@@ -1983,11 +2143,20 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
             f"pin with `pip install \"langfuse>=4.7,<5\"` or update the hook script."
         )
     start_ns = to_otel_nanoseconds(start_time)
-    if parent_otel_span is not None:
-        with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
-            otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
-    else:
-        otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id, forced_parent_span_id)
+    id_generator = install_deterministic_span_ids(langfuse) if id_key else None
+    if id_generator is not None:
+        trace_id_hex = get_trace_id_hex_for_new_span(parent_otel_span, forced_trace_id)
+        if trace_id_hex is not None:
+            id_generator.next_span_id = derive_span_id(trace_id_hex, id_key)
+    try:
+        if parent_otel_span is not None:
+            with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
+                otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+        else:
+            otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id, forced_parent_span_id)
+    finally:
+        if id_generator is not None:
+            id_generator.next_span_id = None
     if as_root:
         # SDK/server contract: spans under a synthetic trace-id carrier have a
         # parentSpanId that never exports, so the server only treats them as
@@ -2383,12 +2552,18 @@ class EmissionCursor:
     emitted: set
     completed_only: bool = False
     newly_emitted: List[str] = field(default_factory=list)
+    # Agent transcripts: emit an incomplete observation now but do not record
+    # it, so the next firing emits it again in its final form. Its id is
+    # deterministic, so the second copy replaces the first.
+    reemit_incomplete: bool = False
 
     def should_emit(self, key: str, complete: bool = True) -> bool:
         if key in self.emitted:
             return False
         if self.completed_only and not complete:
             return False
+        if self.reemit_incomplete and not complete:
+            return True
         self.emitted.add(key)
         self.newly_emitted.append(key)
         return True
@@ -2468,6 +2643,7 @@ def emit_single_tool_observation(
             as_type="tool",
             start_time=tool_use_timestamp,
             parent_otel_span=parent_otel_span,
+            id_key=tool_key,
             input=tool_input,
             metadata=tool_metadata,
             **get_status_kwargs(tool_result.status),
@@ -2502,6 +2678,7 @@ def emit_single_tool_observation(
                     subagent,
                     tool_use_timestamp,
                     subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                    workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
                 )
 
     workflow_end_timestamp = None
@@ -2523,6 +2700,8 @@ def emit_single_tool_observation(
             workflow_resolved=workflow_resolved,
             cursor=cursor,
             emission_scope=tool_use_id or tool_key,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
         )
 
     # Exported spans are immutable, so the end time set here must already
@@ -2718,6 +2897,7 @@ def emit_generation_observation(
     generation_name: str,
     start_timestamp: Optional[datetime],
     generation_kwargs: Dict[str, Any],
+    id_key: Optional[str] = None,
 ) -> Any:
     return _start_backdated(
         langfuse,
@@ -2725,6 +2905,7 @@ def emit_generation_observation(
         as_type="generation",
         start_time=start_timestamp,
         parent_otel_span=parent_otel_span,
+        id_key=id_key,
         **generation_kwargs,
     )
 
@@ -2777,6 +2958,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             pending_subagent["subagent"],
             pending_subagent.get("display_start_timestamp") or pending_subagent.get("start_timestamp"),
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
         )
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
 
@@ -2839,6 +3021,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                 generation_name=generation_name,
                 start_timestamp=generation_start_timestamp,
                 generation_kwargs=generation_kwargs,
+                id_key=generation_emission_key(assistant_index, assistant_message),
             )
         update_pending_subagent_display_start_after_launch_response(
             pending_subagents,
@@ -2912,6 +3095,8 @@ def emit_workflow_agent_observations(
     workflow_resolved: bool,
     cursor: EmissionCursor,
     emission_scope: str,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    workflow_agent_transcripts_by_run_id: Optional["WorkflowAgentTranscriptsByRunId"] = None,
 ) -> Optional[datetime]:
     """Emit each workflow-spawned agent transcript under the launching
     "Tool: Workflow" span.
@@ -2955,9 +3140,85 @@ def emit_workflow_agent_observations(
             # (no text in the final message); the journal result is the agent's
             # actual return value, so it becomes the span output instead of "".
             empty_output_fallback=agent_result_json,
+            # A workflow agent can launch agents and workflows of its own.
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
         )
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, agent_end_timestamp)
     return latest_end_timestamp
+
+class AgentRegistry:
+    """Every agent span a session has emitted, with where it hangs and what
+    of its transcript is already exported.
+
+    An agent is not done when its launch first resolves: a background agent
+    that ends a turn while its own background work runs notifies "completed"
+    (an interim result), then resumes on that work's notifications and keeps
+    writing its transcript, launching more agents. Each firing re-emits every
+    registered agent whose transcript grew, under the parent it was first
+    emitted under, so late generations and late-launched agents (at any
+    depth) still arrive. Stored per session, beside the state file.
+    """
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = path
+        self.entries: Dict[str, Dict[str, Any]] = {}
+
+    @classmethod
+    def load(cls, path: Optional[Path]) -> "AgentRegistry":
+        registry = cls(path)
+        if path is None:
+            return registry
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("agents"), dict):
+                registry.entries = {
+                    k: v for k, v in data["agents"].items() if isinstance(k, str) and isinstance(v, dict)
+                }
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            info(f"agent registry unreadable, starting empty ({path}): {type(e).__name__}: {e}")
+        return registry
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"agents": self.entries}, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, self.path)
+        except Exception as e:
+            info(f"agent registry save failed ({self.path}): {type(e).__name__}: {e}")
+
+
+def get_agent_registry_path(session_state_key: str) -> Path:
+    return STATE_DIR / f"langfuse_agents.{session_state_key[:16]}.json"
+
+
+# The registry of the firing in progress; None outside one (one-shot emission
+# then keeps the old behavior: an agent is emitted once, as it is on disk).
+_ACTIVE_AGENT_REGISTRY: "contextvars.ContextVar[Optional[AgentRegistry]]" = contextvars.ContextVar(
+    "cc_langfuse_agent_registry", default=None
+)
+
+
+@contextlib.contextmanager
+def active_agent_registry(registry: Optional[AgentRegistry]) -> Any:
+    token = _ACTIVE_AGENT_REGISTRY.set(registry)
+    try:
+        yield
+    finally:
+        _ACTIVE_AGENT_REGISTRY.reset(token)
+
+
+def _get_file_size(path: Path) -> Optional[int]:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
 
 def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
                                subagent: Dict[str, Any],
@@ -2967,20 +3228,37 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
                                generation_name: str = "Subagent LLM Call",
                                empty_output_fallback: Optional[str] = None,
                                subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+                               workflow_agent_transcripts_by_run_id: Optional["WorkflowAgentTranscriptsByRunId"] = None,
                                ) -> Optional[datetime]:
     path = subagent.get("path")
     if not isinstance(path, Path):
         return start_timestamp
+    agent_id = subagent.get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id:
+        agent_id = path.stem
+
+    registry = _ACTIVE_AGENT_REGISTRY.get()
+    entry = registry.entries.get(agent_id) if registry is not None else None
+    size = _get_file_size(path)
+    if entry is not None and size is not None and entry.get("size") == size:
+        # Already exported as it is on disk now.
+        return parse_timestamp(entry.get("end")) or start_timestamp
+
     rows = read_subagent_jsonl(path)
     if rows is None:
         return start_timestamp
 
-    turns = build_turns(rows)
+    # Notifications inside the agent's transcript may carry only a task id.
+    turns = build_turns(rows, get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id))
     if not turns:
         return start_timestamp
 
     first_turn = turns[0]
-    subagent_start_timestamp = start_timestamp or parse_timestamp(first_turn.user_msg)
+    # A re-emitted agent span keeps the start it was first exported with.
+    stored_start_timestamp = parse_timestamp(entry.get("start")) if entry else None
+    subagent_start_timestamp = (
+        stored_start_timestamp or start_timestamp or parse_timestamp(first_turn.user_msg)
+    )
     subagent_input_text, subagent_input_meta = truncate_text(extract_text_from_content(get_content_from_row(first_turn.user_msg)))
 
     last_turn = turns[-1]
@@ -3009,44 +3287,140 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
         as_type="span",
         start_time=subagent_start_timestamp,
         parent_otel_span=parent_otel_span,
+        id_key=f"agent:{agent_id}",
         input={"role": "user", "content": subagent_input_text},
         metadata=subagent_metadata,
         **get_status_kwargs(get_worst_turn_status(turns)),
     )
+
+    if registry is not None:
+        cursor = EmissionCursor(
+            emitted=set(k for k in (entry or {}).get("emitted", []) if isinstance(k, str)),
+            reemit_incomplete=True,
+        )
+    else:
+        cursor = fresh_cursor()
 
     latest_end_timestamp = subagent_start_timestamp
     previous_start_timestamp = subagent_start_timestamp
     # The agent transcript is complete on disk, so history accumulates
     # across its turns the same way as in the main conversation.
     subagent_history: List[Dict[str, Any]] = []
-    for turn in turns:
-        latest_turn_timestamp = emit_turn_observations(
-            langfuse,
-            subagent_span._otel_span,
-            turn,
-            previous_start_timestamp,
-            generation_name=generation_name,
-            # Agents launched by this agent are listed in the same map.
-            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
-            history_prefix=list(subagent_history),
-        )
+    for turn_index, turn in enumerate(turns):
+        with id_scope(f"{agent_id}:{turn_index}"):
+            latest_turn_timestamp = emit_turn_observations(
+                langfuse,
+                subagent_span._otel_span,
+                turn,
+                previous_start_timestamp,
+                generation_name=generation_name,
+                # Agents launched by this agent are listed in the same map.
+                subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                cursor=cursor,
+                workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+                history_prefix=list(subagent_history),
+            )
         subagent_history.extend(build_turn_history_messages(turn))
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, latest_turn_timestamp)
         if latest_turn_timestamp is not None:
             previous_start_timestamp = latest_turn_timestamp
 
+    subagent_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_start_timestamp)
     subagent_span.update(output={"role": "assistant", "content": subagent_output_text})
-    subagent_span.end(
-        end_time=to_otel_nanoseconds(
-            _get_latest_timestamp(latest_end_timestamp, subagent_start_timestamp)
-        )
-    )
+    subagent_span.end(end_time=to_otel_nanoseconds(subagent_end_timestamp))
+
+    parent_ids = get_span_context_hex(parent_otel_span) if parent_otel_span is not None else None
+    if registry is not None and parent_ids is not None and size is not None:
+        previous = entry or {}
+        registry.entries[agent_id] = {
+            "path": str(path),
+            "trace_id": previous.get("trace_id") or parent_ids[0],
+            "parent_span_id": previous.get("parent_span_id") or parent_ids[1],
+            "size": size,
+            "start": subagent_start_timestamp.isoformat() if subagent_start_timestamp else None,
+            "end": subagent_end_timestamp.isoformat() if subagent_end_timestamp else None,
+            "emitted": sorted(cursor.emitted),
+            "span_name": span_name,
+            "generation_name": generation_name,
+            # The journal result is re-read on refresh; storing it would only
+            # grow the registry.
+            "extra_metadata": {
+                k: v for k, v in (extra_metadata or {}).items() if k != "workflow_agent_result"
+            },
+            "agent_type": subagent.get("agent_type"),
+            "description": description,
+        }
 
     return latest_end_timestamp
 
+
+def refresh_grown_agents(
+    langfuse: Langfuse,
+    registry: AgentRegistry,
+    *,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    workflow_agent_transcripts_by_run_id: Optional["WorkflowAgentTranscriptsByRunId"] = None,
+) -> int:
+    """Re-emit every registered agent whose transcript grew since it was last
+    exported, under the span it was first emitted under. New observations
+    ship once; incomplete ones and the agent span itself replace their
+    earlier copies (same deterministic ids). Agents launched late by these
+    agents are found by the walk and emitted at their first sight."""
+    refreshed = 0
+    with active_agent_registry(registry):
+        for agent_id, entry in list(registry.entries.items()):
+            path = Path(str(entry.get("path") or ""))
+            size = _get_file_size(path)
+            if size is None or size == entry.get("size"):
+                continue
+            parent = carrier_span(str(entry.get("trace_id") or ""), str(entry.get("parent_span_id") or ""))
+            if parent is None:
+                continue
+            extra_metadata = dict(entry.get("extra_metadata") or {})
+            empty_output_fallback = None
+            run_id = extra_metadata.get("workflow_run_id")
+            if isinstance(run_id, str) and run_id:
+                result = get_workflow_journal_results(path.parent).get(agent_id)
+                if result is not None:
+                    empty_output_fallback, _ = truncate_text(json.dumps(result, ensure_ascii=False))
+                    extra_metadata["workflow_agent_result"] = empty_output_fallback
+            try:
+                emit_subagent_observations(
+                    langfuse,
+                    parent,
+                    {
+                        "path": path,
+                        "agent_id": agent_id,
+                        "agent_type": entry.get("agent_type"),
+                        "description": entry.get("description"),
+                    },
+                    parse_timestamp(entry.get("start")),
+                    span_name=entry.get("span_name") if isinstance(entry.get("span_name"), str) else None,
+                    extra_metadata=extra_metadata,
+                    generation_name=str(entry.get("generation_name") or "Subagent LLM Call"),
+                    empty_output_fallback=empty_output_fallback,
+                    subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                    workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+                )
+                refreshed += 1
+            except Exception as e:
+                info(f"re-emitting grown agent {agent_id} failed: {type(e).__name__}: {e}")
+            # One agent at a time, like a backlog of turns: keeps the span queue bounded.
+            flush_langfuse_client(langfuse)
+    if refreshed:
+        debug(f"Re-emitted {refreshed} grown agent transcript(s)")
+    return refreshed
+
+def split_jsonl_lines(text: str) -> List[str]:
+    """Split JSONL on newline only. str.splitlines() also breaks on U+2028,
+    U+2029, U+0085, form feed and friends, which JSON strings may carry raw:
+    the halves fail to parse and the whole row (an assistant message with
+    its final usage, say) is silently dropped."""
+    return text.split("\n")
+
 def read_subagent_jsonl(path: Path) -> Optional[List[Dict[str, Any]]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = split_jsonl_lines(path.read_text(encoding="utf-8"))
     except Exception as e:
         info(f"transcript read failed ({path}): {type(e).__name__}: {e}")
         return None
@@ -3063,6 +3437,8 @@ def read_subagent_jsonl(path: Path) -> Optional[List[Dict[str, Any]]]:
             continue
         if not isinstance(row, dict):
             info(f"transcript line skipped ({path}:{line_number}): expected JSON object")
+            continue
+        if is_request_echo_row(row):
             continue
         rows.append(row)
     return rows
@@ -3139,6 +3515,18 @@ def is_valid_span_id_hex(span_id: Any) -> bool:
     )
 
 
+# Set only by the backfill: re-uploaded turns land in traces of their own, so
+# they can never mix with the observations a live firing put in the original
+# traces (random-id ones from older versions included).
+TRACE_SEED_NAMESPACE: Optional[str] = None
+
+
+def turn_trace_seed(session_id: str, user_row_uuid: str) -> str:
+    if TRACE_SEED_NAMESPACE:
+        return f"{TRACE_SEED_NAMESPACE}:{session_id}:{user_row_uuid}"
+    return f"{session_id}:{user_row_uuid}"
+
+
 def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
                   root_span_id: Optional[str] = None,
                   trace_id: Optional[str] = None) -> Optional[Any]:
@@ -3168,7 +3556,7 @@ def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
         trace_id = None
     try:
         if trace_id is None:
-            trace_id = langfuse.create_trace_id(seed=f"{session_id}:{user_row_uuid}")
+            trace_id = langfuse.create_trace_id(seed=turn_trace_seed(session_id, user_row_uuid))
         parent_context = otel_trace_api.SpanContext(
             trace_id=int(trace_id, 16),
             span_id=int(root_span_id, 16) if root_span_id else (random.getrandbits(64) or 1),
@@ -3215,6 +3603,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
             forced_trace_id=parent_trace_id,
             forced_parent_span_id=parent_span_id,
             as_root=False,
+            id_key=f"root:{turn.user_msg.get('uuid') or turn_num}",
             input=root_input,
             metadata=trace_metadata,
             **get_status_kwargs(get_turn_status(turn)),
@@ -3234,6 +3623,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
         forced_trace_id=forced_trace_id,
         as_root=True,
+        id_key=f"root:{turn.user_msg.get('uuid') or turn_num}",
         input=root_input,
         metadata=trace_metadata,
         **get_status_kwargs(get_turn_status(turn)),
@@ -3484,44 +3874,42 @@ def emit_ready_observations_of_open_turn(
     except Exception as e:
         info(f"emitting ready observations of open turn failed: {type(e).__name__}: {e}")
 
-def emit_new_turns_from_transcript(
+def emit_session_firing(
     langfuse: Langfuse,
     config: LangfuseConfig,
     session_id: str,
     transcript_path: Path,
+    session_state: SessionState,
+    agent_registry: AgentRegistry,
     *,
     flush_deferred_agent_turns: bool = False,
 ) -> int:
-    key = get_session_state_key(session_id, str(transcript_path))
+    """One firing's emission over the given state: new turns, the ready part
+    of the open turn, then every registered agent whose transcript grew."""
+    subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
+    if subagent_transcripts_by_tool_use_id:
+        debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
 
-    with FileLock(get_session_lock_path(key)):
-        with FileLock(LOCK_FILE):
-            state = load_hook_state()
-        session_state = get_session_state(state, key)
+    workflow_agent_transcripts_by_run_id = WorkflowAgentTranscriptsByRunId(transcript_path)
 
-        subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
-        if subagent_transcripts_by_tool_use_id:
-            debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
+    turns, session_state = get_new_turns_from_transcript(
+        transcript_path,
+        session_state,
+        subagent_transcripts_by_tool_use_id,
+        flush_deferred_agent_turns=flush_deferred_agent_turns,
+        session_id=session_id,
+    )
 
-        workflow_agent_transcripts_by_run_id = WorkflowAgentTranscriptsByRunId(transcript_path)
-
-        turns, session_state = get_new_turns_from_transcript(
+    # One full-file pass per firing serves every turn emitted below.
+    session_history = None
+    if CAPTURE_HISTORY and (turns or session_state.open_turn):
+        session_history = build_session_history(
             transcript_path,
-            session_state,
-            subagent_transcripts_by_tool_use_id,
-            flush_deferred_agent_turns=flush_deferred_agent_turns,
-            session_id=session_id,
+            get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
         )
 
-        # One full-file pass per firing serves every turn emitted below.
-        session_history = None
-        if CAPTURE_HISTORY and (turns or session_state.open_turn):
-            session_history = build_session_history(
-                transcript_path,
-                get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
-            )
-
-        emitted = 0
+    emitted = 0
+    with active_agent_registry(agent_registry):
         if turns:
             turns_to_emit = get_turns_to_emit(
                 turns,
@@ -3561,10 +3949,60 @@ def emit_new_turns_from_transcript(
             session_history=session_history,
         )
 
+    if config.parent_context is None:
+        attribute_propagation = propagate_attributes(
+            session_id=session_id,
+            user_id=config.user_id,
+            trace_name=TRACE_NAME,
+        )
+    else:
+        attribute_propagation = contextlib.nullcontext()
+    try:
+        with attribute_propagation:
+            refresh_grown_agents(
+                langfuse,
+                agent_registry,
+                subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+            )
+    except Exception as e:
+        info(f"refreshing grown agents failed: {type(e).__name__}: {e}")
+    return emitted
+
+
+def emit_new_turns_from_transcript(
+    langfuse: Langfuse,
+    config: LangfuseConfig,
+    session_id: str,
+    transcript_path: Path,
+    *,
+    flush_deferred_agent_turns: bool = False,
+) -> int:
+    key = get_session_state_key(session_id, str(transcript_path))
+
+    with FileLock(get_session_lock_path(key)):
+        with FileLock(LOCK_FILE):
+            state = load_hook_state()
+        session_state = get_session_state(state, key)
+        # Per-session file under the session lock: it can be large, and the
+        # shared state file is rewritten by every session's firing.
+        agent_registry = AgentRegistry.load(get_agent_registry_path(key))
+
+        emitted = emit_session_firing(
+            langfuse,
+            config,
+            session_id,
+            transcript_path,
+            session_state,
+            agent_registry,
+            flush_deferred_agent_turns=flush_deferred_agent_turns,
+        )
+
         # Known limitation (accepted, like the crash-between-emit-and-save
         # duplicate window): progress is persisted before the SDK flush in
         # main(); a dropped flush leaves emitted_keys pointing at spans that
         # never reached the server.
+        agent_registry.save()
         with FileLock(LOCK_FILE):
             state = load_hook_state()
             save_session_state(state, key, session_state)
@@ -3591,6 +4029,267 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
         t.join(FLUSH_TIMEOUT_S)
     except Exception:
         pass
+
+
+# ----------------- Backfill -----------------
+DEFAULT_BACKFILL_NAMESPACE = "backfill-v1"
+
+
+class _RandomIds:
+    def generate_span_id(self) -> int:
+        return random.getrandbits(64) or 1
+
+    def generate_trace_id(self) -> int:
+        return random.getrandbits(128) or 1
+
+    def is_trace_id_random(self) -> bool:
+        return True
+
+
+class _RecordingTracer:
+    """Dry-run tracer: real OTel span contexts (so nesting and trace ids
+    behave as in a live run), nothing recorded or exported by OTel."""
+
+    def __init__(self) -> None:
+        self.id_generator: Any = _RandomIds()
+        self.names: Dict[int, str] = {}
+        self.parents: Dict[int, int] = {}
+
+    def start_span(self, *, name: str, start_time: Optional[int] = None, context: Any = None) -> Any:
+        parent_context = otel_trace_api.get_current_span(context).get_span_context()
+        span_id = self.id_generator.generate_span_id()
+        if parent_context is not None and parent_context.is_valid:
+            trace_id = parent_context.trace_id
+            self.parents[span_id] = parent_context.span_id
+        else:
+            trace_id = self.id_generator.generate_trace_id()
+        self.names[span_id] = name
+        # NonRecordingSpan is an OTel Span, so use_span/get_current_span
+        # accept it as a parent for the next span.
+        return otel_trace_api.NonRecordingSpan(otel_trace_api.SpanContext(
+            trace_id=trace_id, span_id=span_id, is_remote=False,
+            trace_flags=otel_trace_api.TraceFlags(0x01),
+        ))
+
+
+class _RecordedObservation:
+    def __init__(self, recorder: "RecordingLangfuse", otel_span: Any, as_type: str,
+                 kwargs: Dict[str, Any]) -> None:
+        self._recorder = recorder
+        self._otel_span = otel_span
+        context = otel_span.get_span_context()
+        self.id = f"{context.span_id:016x}"
+        self.trace_id = f"{context.trace_id:032x}"
+        self.name = recorder._otel_tracer.names.get(context.span_id, "")
+        self.as_type = as_type
+        self.usage_details = kwargs.get("usage_details")
+        metadata = kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else {}
+        self.transcript_path = metadata.get("transcript_path") if as_type == "span" else None
+        recorder.record(self)
+
+    def update(self, **kwargs: Any) -> None:
+        if "usage_details" in kwargs:
+            self.usage_details = kwargs["usage_details"]
+
+    def end(self, *, end_time: Optional[int] = None) -> None:
+        pass
+
+
+class RecordingLangfuse:
+    """Stands in for the Langfuse client in a dry run: every observation the
+    emission would export is recorded by id instead of sent. An id seen twice
+    is a replacement on the server, never a second observation."""
+
+    def __init__(self) -> None:
+        self._otel_tracer = _RecordingTracer()
+        self.by_id: Dict[str, _RecordedObservation] = {}
+        self.emissions = 0
+
+    @staticmethod
+    def create_trace_id(*, seed: Optional[str] = None) -> str:
+        return Langfuse.create_trace_id(seed=seed)
+
+    def record(self, observation: _RecordedObservation) -> None:
+        self.emissions += 1
+        self.by_id[observation.id] = observation
+
+    def _create_observation_from_otel_span(self, *, otel_span: Any, as_type: str, **kwargs: Any) -> Any:
+        return _RecordedObservation(self, otel_span, as_type, kwargs)
+
+    def flush(self) -> None:
+        pass
+
+    def summary(self) -> Dict[str, Any]:
+        usage: Dict[str, int] = {}
+        generations = 0
+        zero_usage_generations = 0
+        traces = set()
+        for observation in self.by_id.values():
+            traces.add(observation.trace_id)
+            if observation.as_type != "generation":
+                continue
+            generations += 1
+            if not observation.usage_details:
+                zero_usage_generations += 1
+                continue
+            for k, v in observation.usage_details.items():
+                usage[k] = usage.get(k, 0) + int(v)
+        return {
+            "observations": len(self.by_id),
+            "emissions": self.emissions,
+            "traces": len(traces),
+            "generations": generations,
+            "zero_usage_generations": zero_usage_generations,
+            "usage": usage,
+        }
+
+    def per_agent(self) -> Dict[str, Dict[str, Any]]:
+        """Generations and usage per agent transcript (main = the session)."""
+        tracer = self._otel_tracer
+        agent_of_span: Dict[int, str] = {}
+        for observation in self.by_id.values():
+            if observation.transcript_path and observation.name.startswith(("Subagent", "Workflow agent")):
+                agent_of_span[int(observation.id, 16)] = observation.transcript_path
+
+        def owner(span_id: int) -> str:
+            seen = 0
+            while span_id in tracer.parents and seen < 1000:
+                span_id = tracer.parents[span_id]
+                if span_id in agent_of_span:
+                    return agent_of_span[span_id]
+                seen += 1
+            return "main"
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for observation in self.by_id.values():
+            if observation.as_type != "generation":
+                continue
+            entry = out.setdefault(owner(int(observation.id, 16)), {"generations": 0, "zero": 0, "usage": {}})
+            entry["generations"] += 1
+            if not observation.usage_details:
+                entry["zero"] += 1
+            for k, v in (observation.usage_details or {}).items():
+                entry["usage"][k] = entry["usage"].get(k, 0) + int(v)
+        for path in agent_of_span.values():
+            out.setdefault(path, {"generations": 0, "zero": 0, "usage": {}})
+        return out
+
+
+def get_backfill_trace_ids(langfuse: Any, session_id: str, transcript_path: Path) -> set:
+    """Trace ids the backfill gives the turns of this transcript."""
+    trace_ids = set()
+    rows = read_subagent_jsonl(transcript_path) or []
+    for row in rows:
+        uuid = row.get("uuid")
+        if get_user_or_assistant_role_from_row(row) == "user" and isinstance(uuid, str) and uuid:
+            trace_ids.add(langfuse.create_trace_id(seed=turn_trace_seed(session_id, uuid)))
+    return trace_ids
+
+
+def delete_other_session_traces(langfuse: Any, session_id: str, keep: set) -> int:
+    """Delete every trace of the session whose id is not in keep: the copies
+    a live hook exported before (random observation ids, partial agents)."""
+    doomed: List[str] = []
+    page = 1
+    while True:
+        traces = langfuse.api.trace.list(session_id=session_id, page=page, limit=100, fields="core")
+        data = list(getattr(traces, "data", None) or [])
+        doomed += [t.id for t in data if getattr(t, "id", None) and t.id not in keep]
+        total_pages = getattr(getattr(traces, "meta", None), "total_pages", None) or page
+        if not data or page >= total_pages:
+            break
+        page += 1
+    for i in range(0, len(doomed), 100):
+        langfuse.api.trace.delete_multiple(trace_ids=doomed[i:i + 100])
+    return len(doomed)
+
+
+def backfill_session(
+    langfuse: Any,
+    config: LangfuseConfig,
+    session_id: str,
+    transcript_path: Path,
+) -> int:
+    """Emit a whole past session from its transcript in one pass, as at
+    SessionEnd: fresh state, every turn closed, every agent read in full.
+    Observation ids are deterministic and trace ids come from the backfill
+    namespace, so running it again replaces its own output."""
+    session_state = SessionState()
+    registry = AgentRegistry(None)
+    return emit_session_firing(
+        langfuse, config, session_id, transcript_path, session_state, registry,
+        flush_deferred_agent_turns=True,
+    )
+
+
+def run_backfill(argv: List[str]) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="langfuse_hook.py --backfill",
+        description="Re-upload one past session from its transcript (idempotent).",
+    )
+    parser.add_argument("--backfill", required=True, metavar="TRANSCRIPT",
+                        help="the session's main transcript, <session-id>.jsonl")
+    parser.add_argument("--session-id", default=None,
+                        help="defaults to the transcript file name")
+    parser.add_argument("--namespace", default=DEFAULT_BACKFILL_NAMESPACE,
+                        help="trace-id namespace of the re-uploaded traces")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="build every observation, send nothing, print a summary")
+    parser.add_argument("--per-agent-out", default=None, metavar="FILE",
+                        help="dry run: write generations and usage per agent transcript as JSON")
+    parser.add_argument("--replace-session-traces", action="store_true",
+                        help="delete the session's traces that are not the backfill's own")
+    args = parser.parse_args(argv)
+
+    global TRACE_SEED_NAMESPACE
+    TRACE_SEED_NAMESPACE = args.namespace or DEFAULT_BACKFILL_NAMESPACE
+    transcript_path = Path(args.backfill).expanduser()
+    if not transcript_path.is_file():
+        print(f"no such transcript: {transcript_path}", file=sys.stderr)
+        return 2
+    session_id = args.session_id or transcript_path.stem
+
+    if args.dry_run:
+        config = LangfuseConfig(public_key="", secret_key="", host="", user_id=None)
+        recorder = RecordingLangfuse()
+        turns = backfill_session(recorder, config, session_id, transcript_path)
+        summary = recorder.summary()
+        summary.update({"session_id": session_id, "namespace": TRACE_SEED_NAMESPACE, "turns": turns,
+                        "agent_spans": sum(1 for o in recorder.by_id.values()
+                                           if o.as_type == "span" and o.name.startswith(("Subagent", "Workflow agent")))})
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        if args.per_agent_out:
+            Path(args.per_agent_out).write_text(
+                json.dumps(recorder.per_agent(), indent=1, sort_keys=True), encoding="utf-8"
+            )
+        return 0
+
+    config = get_langfuse_config()
+    if config is None:
+        log_missing_langfuse_config()
+        print("Langfuse keys missing (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)", file=sys.stderr)
+        return 2
+    if config.trace_seed or config.parent_context:
+        print("backfill ignores CC_LANGFUSE_TRACE_SEED / parent trace context", file=sys.stderr)
+        config.trace_seed = None
+        config.parent_trace_id = config.parent_span_id = None
+    langfuse = create_langfuse_client(config)
+    if langfuse is None:
+        return 2
+    try:
+        if args.replace_session_traces:
+            keep = get_backfill_trace_ids(langfuse, session_id, transcript_path)
+            deleted = delete_other_session_traces(langfuse, session_id, keep)
+            print(f"deleted {deleted} earlier trace(s) of session {session_id}")
+        turns = backfill_session(langfuse, config, session_id, transcript_path)
+        print(f"backfilled {turns} turn(s) of session {session_id} (namespace {TRACE_SEED_NAMESPACE})")
+    finally:
+        try:
+            langfuse.flush()
+        finally:
+            langfuse.shutdown()
+    return 0
 
 
 # ----------------- Main -----------------
@@ -3645,4 +4344,6 @@ def main() -> int:
         flush_and_shutdown_langfuse_client(langfuse)
 
 if __name__ == "__main__":
+    if "--backfill" in sys.argv[1:]:
+        sys.exit(run_backfill(sys.argv[1:]))
     sys.exit(main())
