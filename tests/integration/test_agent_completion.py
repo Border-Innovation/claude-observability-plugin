@@ -240,3 +240,157 @@ def test_agent_killed_mid_message_settles_after_the_idle_bound(hook_module, fake
     _age(tmp_path / "transcript" / "subagents" / "agent-x.jsonl", hook_module.AGENT_IDLE_SETTLE_SECONDS + 60)
     fire(hook_module, fake_langfuse, transcript)
     assert len(spans_of(fake_langfuse, "Agent x")) == 1
+
+
+# ------------------------------------------------ revisits between Stops
+
+SETTLED_X = [
+    user("x-u", ts(0, 5), "go"),
+    asst("x-a1", ts(1), "msg_x1", [{"type": "text", "text": "x done"}], 5, "end_turn"),
+]
+
+
+def test_woken_agents_final_message_ships_even_when_never_given_a_stop_reason(hook_module, fake_langfuse, tmp_path):
+    transcript = setup_session(tmp_path, SETTLED_X)
+    fire(hook_module, fake_langfuse, transcript)
+    assert len(spans_of(fake_langfuse, "Agent x")) == 1
+    # Woken by a notification; its new final message is written with
+    # stop_reason null and never completed.
+    write(tmp_path / "transcript" / "subagents" / "agent-x.jsonl", [
+        user("x-n", ts(5), "[SYSTEM NOTIFICATION - NOT USER INPUT]\n" + notification_text("z", "toolu_z", "late"),
+             isMeta=True, origin={"kind": "task-notification"}),
+        asst("x-a2", ts(5, 10), "msg_x2", [{"type": "text", "text": "noted"}], 77, None),
+    ], mode="a")
+    fire(hook_module, fake_langfuse, transcript)
+    assert 77 not in generation_outputs(fake_langfuse), "held message shipped while it may still grow"
+    fire(hook_module, fake_langfuse, transcript)
+    fire(hook_module, fake_langfuse, transcript, end=True)
+    assert generation_outputs(fake_langfuse).count(77) == 1, "the woken agent's last message was lost"
+    assert len(spans_of(fake_langfuse, "Agent x")) == 1
+    assert_no_id_twice(fake_langfuse)
+
+
+def test_held_message_ships_after_the_idle_bound_without_sessionend(hook_module, fake_langfuse, tmp_path):
+    transcript = setup_session(tmp_path, SETTLED_X)
+    fire(hook_module, fake_langfuse, transcript)
+    path = tmp_path / "transcript" / "subagents" / "agent-x.jsonl"
+    write(path, [asst("x-a2", ts(5, 10), "msg_x2", [{"type": "text", "text": "noted"}], 77, None)], mode="a")
+    fire(hook_module, fake_langfuse, transcript)  # first seen fresh: held
+    assert 77 not in generation_outputs(fake_langfuse)
+    _age(path, hook_module.AGENT_IDLE_SETTLE_SECONDS + 60)  # then it ages, unchanged
+    fire(hook_module, fake_langfuse, transcript)
+    assert generation_outputs(fake_langfuse).count(77) == 1
+
+
+def test_unresolved_agent_seen_fresh_settles_once_it_ages(hook_module, fake_langfuse, tmp_path):
+    transcript = setup_session(tmp_path, UNRESOLVED)
+    fire(hook_module, fake_langfuse, transcript)
+    assert spans_of(fake_langfuse, "Agent x") == []
+    fire(hook_module, fake_langfuse, transcript)
+    assert spans_of(fake_langfuse, "Agent x") == []
+    _age(tmp_path / "transcript" / "subagents" / "agent-x.jsonl", hook_module.MAX_DEFER_SECONDS + 60)
+    fire(hook_module, fake_langfuse, transcript)
+    assert len(spans_of(fake_langfuse, "Agent x")) == 1
+
+
+def test_background_shell_keeps_the_agent_awake_until_it_notifies(hook_module, fake_langfuse, tmp_path):
+    rows = [
+        user("x-u", ts(0, 5), "go"),
+        asst("x-a1", ts(1), "msg_x1", [{"type": "tool_use", "id": "toolu_sh", "name": "Bash",
+                                        "input": {"command": "sleep 600", "run_in_background": True}}], 3, "tool_use"),
+        user("x-r1", ts(1, 1), [{"type": "tool_result", "tool_use_id": "toolu_sh",
+                                 "content": "Command running in background with ID: bsh1"}],
+             toolUseResult={"stdout": "", "stderr": "", "interrupted": False, "backgroundTaskId": "bsh1"}),
+        asst("x-a2", ts(1, 2), "msg_x2", [{"type": "text", "text": "waiting for the shell"}], 3, "end_turn"),
+    ]
+    transcript = setup_session(tmp_path, rows)
+    fire(hook_module, fake_langfuse, transcript)
+    assert spans_of(fake_langfuse, "Agent x") == [], "span shipped while the agent's shell still runs"
+    write(tmp_path / "transcript" / "subagents" / "agent-x.jsonl", [
+        # The shell's notification names only its task id.
+        user("x-n", ts(9), "<task-notification>\n<task-id>bsh1</task-id>\n<status>completed</status>\n"
+             "<result>shell done</result>\n</task-notification>", origin={"kind": "task-notification"}),
+        asst("x-a3", ts(9, 5), "msg_x3", [{"type": "text", "text": "x done"}], 21, "end_turn"),
+    ], mode="a")
+    fire(hook_module, fake_langfuse, transcript)
+    [span] = spans_of(fake_langfuse, "Agent x")
+    assert span.output == {"role": "assistant", "content": "x done"}
+
+
+# ------------------------------------------------------------- TaskStop
+
+def test_control_failed_taskstop_with_a_dict_result_resolves_nothing(hook_module):
+    row = user("r", ts(1), [{"type": "tool_result", "tool_use_id": "toolu_stop", "is_error": True,
+                             "content": "not running"}],
+               toolUseResult={"task_id": "wtask1", "message": "not running"})
+    assert hook_module.get_stopped_task_id(row) is None
+
+
+def taskstop_row(task_id: str = "wtask1") -> Dict[str, Any]:
+    return user("m-stop", ts(6, 2), [{"type": "tool_result", "tool_use_id": "toolu_stop",
+                                      "content": f"Successfully stopped task: {task_id}"}],
+                toolUseResult={"message": f"Successfully stopped task: {task_id}", "task_id": task_id,
+                               "task_type": "local_workflow"})
+
+
+def test_taskstop_expansion_is_idempotent(hook_module):
+    launch = user("m-r1", ts(0, 2), [{"type": "tool_result", "tool_use_id": "toolu_wf", "content": "launched"}],
+                  toolUseResult={"status": "async_launched", "taskId": "wtask1"})
+    once = hook_module.expand_task_stop_rows([launch, taskstop_row()], [launch, taskstop_row()])
+    twice = hook_module.expand_task_stop_rows(once, once)
+    assert len(once) == 3 and len(twice) == 3
+
+
+def test_taskstop_falls_back_to_the_task_id_map(hook_module):
+    rows = [taskstop_row("agent7")]
+    expanded = hook_module.expand_task_stop_rows(rows, rows, {"agent7": "toolu_agent7"})
+    assert len(expanded) == 2
+    assert hook_module.get_tool_use_id_from_task_notification(expanded[1]) == "toolu_agent7"
+    assert len(hook_module.expand_task_stop_rows(rows, rows, {})) == 1
+
+
+def test_taskstop_in_a_later_firing_releases_the_deferred_turn(hook_module, fake_langfuse, tmp_path):
+    rows = workflow_turn_rows({"message": "Successfully stopped task: wtask1", "task_id": "wtask1",
+                               "task_type": "local_workflow"})
+    transcript = tmp_path / "transcript.jsonl"
+    stop_index = next(i for i, r in enumerate(rows) if r["uuid"] == "m-u2")
+    write(transcript, rows[:stop_index] + [user("m-human", ts(5), "how is it going?"),
+                                          asst("m-ah", ts(5, 1), "msg_mh", [{"type": "text", "text": "running"}], 1, "end_turn")])
+    fire(hook_module, fake_langfuse, transcript)
+    assert "start a workflow" not in roots_by_user_uuid(fake_langfuse)  # deferred, waiting
+    write(transcript, rows[stop_index:], mode="a")
+    fire(hook_module, fake_langfuse, transcript)
+    assert "start a workflow" in roots_by_user_uuid(fake_langfuse)
+
+
+def test_agent_settles_when_it_stops_its_own_workflow(hook_module, fake_langfuse, tmp_path):
+    rows = [
+        user("x-u", ts(0, 5), "go"),
+        asst("x-a1", ts(1), "msg_x1", [{"type": "tool_use", "id": "toolu_wf", "name": "Workflow",
+                                        "input": {"script": "r"}}], 3, "tool_use"),
+        user("x-r1", ts(1, 1), [{"type": "tool_result", "tool_use_id": "toolu_wf", "content": "launched"}],
+             toolUseResult={"status": "async_launched", "isAsync": True, "taskId": "wtask9", "runId": "wf_none"}),
+        asst("x-a2", ts(1, 2), "msg_x2", [{"type": "tool_use", "id": "toolu_stop", "name": "TaskStop",
+                                           "input": {"task_id": "wtask9"}}], 3, "tool_use"),
+        user("x-r2", ts(1, 3), [{"type": "tool_result", "tool_use_id": "toolu_stop", "content": "stopped"}],
+             toolUseResult={"message": "Successfully stopped task: wtask9", "task_id": "wtask9"}),
+        asst("x-a3", ts(1, 4), "msg_x3", [{"type": "text", "text": "x done"}], 8, "end_turn"),
+    ]
+    transcript = setup_session(tmp_path, rows)
+    fire(hook_module, fake_langfuse, transcript)
+    assert len(spans_of(fake_langfuse, "Agent x")) == 1
+
+
+def test_deferred_turn_queue_ages_out(hook_module, fake_langfuse, tmp_path):
+    rows = workflow_turn_rows("Error: not running")
+    transcript = tmp_path / "transcript.jsonl"
+    stop_index = next(i for i, r in enumerate(rows) if r["uuid"] == "m-u2")
+    write(transcript, rows[:stop_index] + [user("m-human", ts(5), "status?"),
+                                          asst("m-ah", ts(5, 1), "msg_mh", [{"type": "text", "text": "running"}], 1, "end_turn")])
+    fire(hook_module, fake_langfuse, transcript)  # turn 1 goes to the deferred queue
+    assert "start a workflow" not in roots_by_user_uuid(fake_langfuse)
+    write(transcript, [user("m-late", ts(0, 0, 23), "hours later"),
+                       asst("m-al", ts(0, 1, 23), "msg_ml", [{"type": "text", "text": "ok"}], 1, "end_turn"),
+                       user("m-late2", ts(1, 0, 23), "again")], mode="a")
+    fire(hook_module, fake_langfuse, transcript)
+    assert "start a workflow" in roots_by_user_uuid(fake_langfuse)

@@ -93,7 +93,14 @@ the hook are read from the environment.
 - After the upload, the backfill reads the session back from Langfuse until
   every observation it sent is visible (up to 10 minutes). If any is
   missing it exits with code 4 and deletes nothing: a rejected upload is
-  only logged by the exporter, never raised.
+  only logged by the exporter, never raised. `--verify-minutes` changes the
+  window.
+- After exit 4: if Langfuse is only slow to ingest, run again with
+  `--verify-only` and the same `--namespace`. It uploads nothing (the ids
+  are deterministic), re-reads, and with `--replace-session-traces`
+  deletes the old traces once everything is visible. If the upload really
+  failed, start over with a new `--namespace` and
+  `--replace-session-traces`; that also removes the partial upload.
 - `--replace-session-traces` then deletes the session's traces this hook
   named `Claude Code Turn` that are not the backfill's own. Traces under
   another name are never touched. With `--dry-run` it lists them instead.

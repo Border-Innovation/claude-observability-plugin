@@ -207,3 +207,55 @@ def test_a_recently_written_agent_transcript_counts_as_live(hook_module, client,
     c = client([])
     assert hook_module.run_backfill(["--backfill", str(transcript)]) == 3
     assert c.observations == []
+
+
+def test_read_back_retries_until_ingestion_catches_up(hook_module, client, tmp_path):
+    transcript = write_transcript(tmp_path)
+    c = client([trace("old-turn", hook_module.TRACE_NAME)])
+    real_list = c.api.trace.list
+    calls = {"n": 0}
+
+    def slow_list(**kwargs):
+        # The first read-back sees nothing yet; the second sees the upload.
+        if "observations" in str(kwargs.get("fields")):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return SimpleNamespace(data=list(c.api.trace.traces), meta=SimpleNamespace(total_pages=1))
+        return real_list(**kwargs)
+
+    c.api.trace.list = slow_list
+    assert hook_module.run_backfill(["--backfill", str(transcript), "--replace-session-traces"]) == 0
+    assert c.api.trace.deleted == ["old-turn"]
+
+
+def test_verify_only_uploads_nothing_and_finishes_the_replacement(hook_module, client, tmp_path):
+    transcript = write_transcript(tmp_path)
+    c = client([trace("old-turn", hook_module.TRACE_NAME)])
+    assert hook_module.run_backfill(["--backfill", str(transcript)]) == 0
+    uploaded = len(c.observations)
+    code = hook_module.run_backfill(["--backfill", str(transcript), "--verify-only", "--replace-session-traces"])
+    assert code == 0
+    assert len(c.observations) == uploaded, "--verify-only uploaded again"
+    assert c.api.trace.deleted == ["old-turn"]
+
+
+def test_verify_only_refuses_when_nothing_landed(hook_module, client, tmp_path):
+    transcript = write_transcript(tmp_path)
+    c = client([trace("old-turn", hook_module.TRACE_NAME)])
+    assert hook_module.run_backfill(["--backfill", str(transcript), "--verify-only",
+                                     "--replace-session-traces"]) == 4
+    assert c.observations == [] and c.api.trace.deleted == []
+
+
+def test_nothing_to_verify_never_counts_as_verified(hook_module, client, tmp_path):
+    # A transcript the emission turns into zero observations: an empty
+    # expectation must not "verify" and license the delete.
+    path = tmp_path / f"{SESSION}.jsonl"
+    path.write_text(json.dumps({"type": "user", "uuid": "u1", "sessionId": SESSION,
+                                "timestamp": "2026-08-01T10:00:00.000Z",
+                                "message": {"role": "user", "content": "hi"}}) + "\n", encoding="utf-8")
+    then = time.time() - 7200
+    os.utime(path, (then, then))
+    c = client([trace("old-turn", hook_module.TRACE_NAME)])
+    assert hook_module.run_backfill(["--backfill", str(path), "--replace-session-traces"]) == 4
+    assert c.api.trace.deleted == []

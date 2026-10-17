@@ -95,6 +95,10 @@ def _install_langfuse_stubs() -> None:
             self.is_remote = is_remote
             self.trace_flags = trace_flags
 
+        @property
+        def is_valid(self) -> bool:
+            return bool(self.trace_id) and bool(self.span_id)
+
     class NonRecordingSpan:
         def __init__(self, span_context: SpanContext) -> None:
             self._span_context = span_context
@@ -102,14 +106,25 @@ def _install_langfuse_stubs() -> None:
         def get_span_context(self) -> SpanContext:
             return self._span_context
 
+        def set_attribute(self, key: str, value: Any) -> None:
+            pass
+
     def set_span_in_context(span: Any, context: Any = None) -> dict[str, Any]:
         return {"current_span": span}
+
+    def get_current_span(context: Any = None) -> Any:
+        if isinstance(context, dict) and context.get("current_span") is not None:
+            return context["current_span"]
+        if _ACTIVE_SPAN_STACK and _ACTIVE_SPAN_STACK[-1] is not None:
+            return _ACTIVE_SPAN_STACK[-1]
+        return NonRecordingSpan(SpanContext(0, 0, False))
 
     trace_module.use_span = use_span
     trace_module.TraceFlags = TraceFlags
     trace_module.SpanContext = SpanContext
     trace_module.NonRecordingSpan = NonRecordingSpan
     trace_module.set_span_in_context = set_span_in_context
+    trace_module.get_current_span = get_current_span
     opentelemetry_module.trace = trace_module
     sys.modules["opentelemetry"] = opentelemetry_module
     sys.modules["opentelemetry.trace"] = trace_module

@@ -1332,13 +1332,18 @@ def get_stopped_task_id(row: Dict[str, Any]) -> Optional[str]:
 
 def get_launch_tool_use_ids_by_task_id(rows: List[Dict[str, Any]]) -> Dict[str, str]:
     """task id -> launching tool_use id, from async launch results
-    (toolUseResult.taskId for workflows and shells, agentId for agents)."""
+    (toolUseResult.taskId for workflows, agentId for agents,
+    backgroundTaskId for background shells)."""
     out: Dict[str, str] = {}
     for row in rows:
         tool_use_result = row.get("toolUseResult") if isinstance(row, dict) else None
         if not isinstance(tool_use_result, dict):
             continue
-        task_id = tool_use_result.get("taskId") or tool_use_result.get("agentId")
+        task_id = (
+            tool_use_result.get("taskId")
+            or tool_use_result.get("agentId")
+            or tool_use_result.get("backgroundTaskId")
+        )
         if not isinstance(task_id, str) or not task_id:
             continue
         for block in get_tool_result_blocks(get_content_from_row(row)):
@@ -1476,6 +1481,11 @@ def add_tool_result_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
                 tool_result_entry["is_error"] = tool_result_block["is_error"]
             if is_async_launch is not None:
                 tool_result_entry["is_async_launch"] = is_async_launch
+            background_task_id = (row.get("toolUseResult") or {}).get("backgroundTaskId") if isinstance(row.get("toolUseResult"), dict) else None
+            if isinstance(background_task_id, str) and background_task_id:
+                # A shell moved to the background (run_in_background, or a
+                # command that outlived its timeout); it notifies when done.
+                tool_result_entry["background_task_id"] = background_task_id
             if workflow_launch_marker is not None:
                 # Links the launching tool_use to its workflow run so emission
                 # can attach the run's agent transcripts (which have no
@@ -3364,6 +3374,13 @@ def active_agent_registry(registry: Optional[AgentRegistry]) -> Any:
         _ACTIVE_AGENT_REGISTRY.reset(token)
 
 
+def _get_file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return time.time()
+
+
 def _get_file_size(path: Path) -> Optional[int]:
     try:
         return path.stat().st_size
@@ -3422,7 +3439,7 @@ def agent_is_settled(turns: List[Turn]) -> bool:
     if not turns:
         return False
     for turn in turns:
-        if turn_has_unresolved_async_activity(turn):
+        if turn_has_unresolved_async_activity(turn) or get_running_background_shell_ids(turn):
             return False
     last_turn = turns[-1]
     for assistant_message in last_turn.assistant_msgs:
@@ -3442,9 +3459,42 @@ def agent_is_settled_but_for_streaming(turns: List[Turn]) -> bool:
     stop_reason (used once the transcript has been idle for a long time)."""
     if not turns:
         return False
-    if any(turn_has_unresolved_async_activity(turn) for turn in turns):
+    if any(turn_has_unresolved_async_activity(turn) or get_running_background_shell_ids(turn) for turn in turns):
         return False
     return True
+
+
+def get_running_background_shell_ids(turn: Turn) -> List[str]:
+    """Background shells of the turn with no notification yet. Counted only
+    when deciding whether an AGENT is at rest (its span ships once, so it
+    must not ship before the shell's notification wakes the agent); main
+    turns keep their own gate."""
+    return [
+        tool_use_id for tool_use_id, entry in turn.tool_results_by_id.items()
+        if isinstance(entry, dict) and entry.get("background_task_id") and entry.get("final_content") is None
+    ]
+
+
+def agent_entry_needs_visit(entry: Dict[str, Any], size: Optional[int], force: bool,
+                            path: Optional[Path] = None) -> bool:
+    """A registered agent is re-read when its transcript grew, when it is
+    not at rest yet (an idle bound may settle it although nothing changed),
+    when it holds a message back, or, at SessionEnd, when its span has not
+    shipped."""
+    if size is None:
+        return False
+    if size != entry.get("size"):
+        return True
+    if force:
+        return bool(entry.get("unsettled") or entry.get("held") or not entry.get("span_exported"))
+    if entry.get("unsettled") or entry.get("held"):
+        # Unchanged on disk: only an idle bound can settle it, so wait until
+        # that bound is due instead of re-reading it every firing.
+        bound = entry.get("idle_bound_s")
+        if not isinstance(bound, (int, float)) or path is None:
+            return True
+        return time.time() - _get_file_mtime(path) > bound
+    return False
 
 
 def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
@@ -3485,12 +3535,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     entry = registry.entries.get(agent_id) if registry is not None else None
     force = _FORCE_FINALIZE.get()
     size = _get_file_size(path)
-    if (
-        entry is not None
-        and size is not None
-        and entry.get("size") == size
-        and (entry.get("span_exported") or not force)
-    ):
+    if entry is not None and size is not None and not agent_entry_needs_visit(entry, size, force, path):
         # Nothing new on disk, and nothing left to finalize.
         return parse_timestamp(entry.get("end")) or start_timestamp
 
@@ -3498,8 +3543,12 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     if rows is None:
         return start_timestamp
 
-    # Notifications inside the agent's transcript may carry only a task id.
-    turns = build_turns(rows, get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id))
+    # Notifications inside the agent's transcript may carry only a task id:
+    # agents' ids come from the metas, shells' and workflows' from the
+    # agent's own launch results.
+    task_id_map = get_launch_tool_use_ids_by_task_id(rows)
+    task_id_map.update(get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id))
+    turns = build_turns(rows, task_id_map)
     if not turns:
         return start_timestamp
 
@@ -3630,6 +3679,12 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             "parent_span_id": parent_ids[1],
             "size": size,
             "span_exported": span_exported,
+            # Re-visited every firing while set (see agent_entry_needs_visit).
+            "unsettled": not settled,
+            "held": sorted(cursor.held),
+            "idle_bound_s": (
+                AGENT_IDLE_SETTLE_SECONDS if streaming_key is not None else MAX_DEFER_SECONDS
+            ) if not settled else None,
             "start": subagent_start_timestamp.isoformat() if subagent_start_timestamp else None,
             "end": subagent_end_timestamp.isoformat() if subagent_end_timestamp else None,
             "emitted": sorted(cursor.emitted),
@@ -3665,9 +3720,7 @@ def refresh_grown_agents(
         for agent_id, entry in list(registry.entries.items()):
             path = Path(str(entry.get("path") or ""))
             size = _get_file_size(path)
-            if size is None:
-                continue
-            if size == entry.get("size") and (entry.get("span_exported") or not force):
+            if not agent_entry_needs_visit(entry, size, force, path):
                 continue
             parent = carrier_span(str(entry.get("trace_id") or ""), str(entry.get("parent_span_id") or ""))
             if parent is None:
@@ -4658,12 +4711,19 @@ def run_backfill(argv: List[str]) -> int:
                         help="dry run: write generations and usage per agent transcript as JSON")
     parser.add_argument("--replace-session-traces", action="store_true",
                         help="after the upload, delete this hook's earlier turn traces of the session")
+    parser.add_argument("--verify-only", action="store_true",
+                        help="upload nothing: read back an earlier upload of this namespace (ids are "
+                             "deterministic) and, with --replace-session-traces, delete the old traces once it verifies")
+    parser.add_argument("--verify-minutes", type=float, default=None,
+                        help="how long the read-back keeps retrying (default 10)")
     parser.add_argument("--force", action="store_true",
                         help=f"run on a transcript modified less than {BACKFILL_MIN_IDLE_MINUTES:.0f} min ago")
     args = parser.parse_args(argv)
 
-    global TRACE_SEED_NAMESPACE
+    global TRACE_SEED_NAMESPACE, BACKFILL_VERIFY_ATTEMPTS
     TRACE_SEED_NAMESPACE = args.namespace or DEFAULT_BACKFILL_NAMESPACE
+    if args.verify_minutes is not None:
+        BACKFILL_VERIFY_ATTEMPTS = max(1, int(args.verify_minutes * 60 / max(BACKFILL_VERIFY_INTERVAL_S, 1e-9)) + 1)
     transcript_path = Path(args.backfill).expanduser()
     if not transcript_path.is_file():
         print(f"no such transcript: {transcript_path}", file=sys.stderr)
@@ -4687,8 +4747,8 @@ def run_backfill(argv: List[str]) -> int:
     # A dry run reads Langfuse only when asked for the delete plan.
     if langfuse is not None and (not args.dry_run or args.replace_session_traces):
         existing = list_session_traces(langfuse, session_id)
-        already = [trace_id for trace_id, _ in existing if trace_id in keep]
-        if already:
+        already = [item[0] for item in existing if item[0] in keep]
+        if already and not args.verify_only:
             print(f"refused: namespace {TRACE_SEED_NAMESPACE!r} already holds {len(already)} trace(s) of "
                   f"session {session_id}; uploading again would count them twice. Use a new --namespace "
                   "with --replace-session-traces to supersede them.", file=sys.stderr)
@@ -4724,17 +4784,34 @@ def run_backfill(argv: List[str]) -> int:
         print("Langfuse keys missing (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)", file=sys.stderr)
         return 2
     try:
-        # Upload first: if it fails part-way, the old traces are still there.
-        expected = record_uploaded_observation_ids(langfuse)
-        turns = backfill_session(langfuse, config, session_id, transcript_path)
-        langfuse.flush()
-        print(f"uploaded {turns} turn(s) of session {session_id} (namespace {TRACE_SEED_NAMESPACE}); "
-              f"verifying {sum(len(v) for v in expected.values())} observation(s) in {len(expected)} trace(s)")
+        if args.verify_only:
+            # Ids are deterministic: rebuild what the upload sent, send nothing.
+            recorder = RecordingLangfuse()
+            turns = backfill_session(recorder, config, session_id, transcript_path)
+            expected: Dict[str, set] = {}
+            for observation in recorder.by_id.values():
+                expected.setdefault(observation.trace_id, set()).add(observation.id)
+        else:
+            # Upload first: if it fails part-way, the old traces are still there.
+            expected = record_uploaded_observation_ids(langfuse)
+            turns = backfill_session(langfuse, config, session_id, transcript_path)
+            langfuse.flush()
+            print(f"uploaded {turns} turn(s) of session {session_id} (namespace {TRACE_SEED_NAMESPACE})")
+        print(f"verifying {sum(len(v) for v in expected.values())} observation(s) in {len(expected)} trace(s)")
+        if not expected:
+            # Nothing to compare against would verify vacuously.
+            print("refused: the backfill produced no observations to verify; nothing was deleted.",
+                  file=sys.stderr)
+            return 4
         missing = verify_upload(langfuse, session_id, expected)
         if missing:
             print(f"refused: {sum(missing.values())} uploaded observation(s) in {len(missing)} trace(s) "
-                  f"are not readable back from Langfuse; the upload failed or is still being ingested. "
-                  f"Nothing was deleted.", file=sys.stderr)
+                  f"are not readable back from Langfuse. Nothing was deleted.\n"
+                  f"  Still ingesting? Re-check without uploading: --verify-only with the same "
+                  f"--namespace {TRACE_SEED_NAMESPACE} (add --replace-session-traces to delete the old "
+                  f"traces once it verifies; --verify-minutes to wait longer).\n"
+                  f"  Upload failed? Start over with a new --namespace and --replace-session-traces; "
+                  f"that also removes this partial upload.", file=sys.stderr)
             return 4
         print("verified: every uploaded observation is readable back")
         if args.replace_session_traces:
