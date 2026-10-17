@@ -111,7 +111,9 @@ def test_entry_of_another_session_survives_the_emit(
     def other_session_saves() -> None:
         with hook_module.FileLock(hook_module.LOCK_FILE):
             state = hook_module.load_hook_state()
-            state["other-session-key"] = {"offset": 42, "updated": "2026-09-10T00:00:00+00:00"}
+            # A fresh timestamp: a fixed date ages past the 30-day sweep and the
+            # test then fails for a reason unrelated to the lock.
+            state["other-session-key"] = {"offset": 42, "updated": datetime.now(timezone.utc).isoformat()}
             hook_module.save_hook_state(state)
 
     _during_emit(hook_module, monkeypatch, other_session_saves)
