@@ -70,7 +70,7 @@
     "CC_LANGFUSE_DETERMINISTIC_IDS": {
       "type": "boolean",
       "title": "Deterministic observation ids",
-      "description": "Derive each observation id from its trace id and a stable key (message id, tool_use id, agent id). A re-emitted observation, such as a background agent that resumed after an interim result, then replaces its earlier copy instead of duplicating it. Set to false for random ids.",
+      "description": "Derive each observation id from its trace id and a stable key (message id, tool_use id, agent id). Needed to continue a background agent that resumed after an interim result: its later work attaches to its span id across firings. Set to false for random ids; agents then ship once, as they are on disk at their first result.",
       "default": true
     },
     "CC_LANGFUSE_STATE_DIR": {

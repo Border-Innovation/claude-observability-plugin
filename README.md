@@ -84,11 +84,18 @@ uv run --script hooks/langfuse_hook.py \
 
 `--dry-run` builds every observation, sends nothing, and prints the counts
 and token totals that would be exported. Without it, the same Langfuse keys as
-the hook are read from the environment. The re-uploaded turns go to traces
-of their own (`--namespace`, default `backfill-v1`) with deterministic
-observation ids, so a second run replaces the first. Add
-`--replace-session-traces` to delete the session's other traces, the ones a
-live hook exported before, so the session is not counted twice.
+the hook are read from the environment.
+
+- The re-uploaded turns go to traces of their own (`--namespace`, default
+  `backfill-v1`). Langfuse v4 does not merge two uploads of one observation
+  id, so a namespace that already holds traces of the session is refused;
+  supersede an earlier backfill with a new namespace.
+- `--replace-session-traces` deletes, after the upload has been flushed, the
+  session's traces this hook named `Claude Code Turn` that are not the
+  backfill's own. Traces under another name are never touched. With
+  `--dry-run` it lists them instead.
+- The session id must be the transcript's own, and a transcript modified in
+  the last 30 minutes is refused unless `--force` is passed.
 
 ## Troubleshooting
 

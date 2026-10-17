@@ -59,3 +59,33 @@ def test_corrupt_registry_starts_empty(hook_module, tmp_path):
     registry.entries["a"] = {"size": 1}
     registry.save()
     assert json.loads(path.read_text(encoding="utf-8")) == {"agents": {"a": {"size": 1}}}
+
+
+def test_corrupt_registry_falls_back_to_the_previous_version(hook_module, tmp_path, caplog):
+    path = tmp_path / "langfuse_agents.0123456789abcdef.json"
+    registry = hook_module.AgentRegistry(path)
+    registry.entries = {"a": {"size": 1}}
+    registry.save()
+    registry.entries = {"a": {"size": 2}}
+    registry.save()  # the first version is now the .bak
+    path.write_text("{torn", encoding="utf-8")
+    with caplog.at_level("INFO"):
+        loaded = hook_module.AgentRegistry.load(path)
+    assert loaded.entries == {"a": {"size": 1}}
+    assert any("WARNING agent registry unreadable" in r.getMessage() for r in caplog.records)
+
+
+def test_stray_registry_tmp_is_swept(hook_module, isolated_hook_state):
+    import os
+    import time
+    from datetime import datetime, timezone
+    isolated_hook_state.mkdir(parents=True, exist_ok=True)
+    stray = isolated_hook_state / "langfuse_agents.0123456789abcdef.tmp"
+    stray.write_text("{}", encoding="utf-8")
+    old = time.time() - 2 * 24 * 3600
+    os.utime(stray, (old, old))
+    fresh = isolated_hook_state / "langfuse_agents.fedcba9876543210.tmp"
+    fresh.write_text("{}", encoding="utf-8")
+    hook_module.save_hook_state({"x": {"updated": datetime.now(timezone.utc).isoformat()}})
+    assert not stray.exists()
+    assert fresh.exists()

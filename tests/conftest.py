@@ -188,6 +188,17 @@ class FakeOtelSpan:
         self.attributes[key] = value
 
 
+def nests_under(observation: Any, parent_observation: Any) -> bool:
+    """Nesting as Langfuse sees it: the parent's span id, whether the child
+    was started under the parent object or under a carrier with its ids."""
+    parent = observation._otel_span.parent
+    if parent is None or not hasattr(parent, "get_span_context"):
+        return False
+    a = parent.get_span_context()
+    b = parent_observation._otel_span.get_span_context()
+    return (a.trace_id, a.span_id) == (b.trace_id, b.span_id)
+
+
 class FakeTracer:
     """Mirrors the SDK tracer: the span id comes from self.id_generator, the
     trace id from the parent span (active span or context carrier)."""
