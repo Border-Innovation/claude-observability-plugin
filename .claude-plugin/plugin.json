@@ -1,7 +1,7 @@
 {
   "name": "langfuse-observability",
   "description": "The Langfuse x Claude Code Observability Plugin",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "author": {
     "name": "Langfuse"
   },
@@ -65,6 +65,12 @@
       "type": "boolean",
       "title": "Capture conversation history",
       "description": "Send the conversation so far as each LLM call's input. On long sessions this grows quadratically and span batches can exceed the exporter's 64 MiB limit, which drops them. Set to false to send each call's own new input only.",
+      "default": true
+    },
+    "CC_LANGFUSE_DETERMINISTIC_IDS": {
+      "type": "boolean",
+      "title": "Deterministic observation ids",
+      "description": "Derive each observation id from its trace id and a stable key (message id, tool_use id, agent id). Needed to continue a background agent that resumed after an interim result: its later work attaches to its span id across firings. Set to false for random ids; agents then ship once, as they are on disk at their first result.",
       "default": true
     },
     "CC_LANGFUSE_STATE_DIR": {

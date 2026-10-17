@@ -71,6 +71,43 @@ claude plugin update langfuse-observability@langfuse-observability
 Restart Claude Code afterwards. `claude plugin list` shows the installed
 version.
 
+## Backfilling a past session
+
+The hook can re-upload a finished session from its transcript, for example
+to repair traces a version with a known gap exported incompletely. Run it
+only after the session has ended.
+
+```bash
+uv run --script hooks/langfuse_hook.py \
+  --backfill ~/.claude/projects/<project>/<session-id>.jsonl --dry-run
+```
+
+`--dry-run` builds every observation, sends nothing, and prints the counts
+and token totals that would be exported. Without it, the same Langfuse keys as
+the hook are read from the environment.
+
+- The re-uploaded turns go to traces of their own (`--namespace`, default
+  `backfill-v1`). Langfuse v4 does not merge two uploads of one observation
+  id, so a namespace that already holds traces of the session is refused;
+  supersede an earlier backfill with a new namespace.
+- After the upload, the backfill reads the session back from Langfuse until
+  every observation it sent is visible (up to 10 minutes). If any is
+  missing it exits with code 4 and deletes nothing: a rejected upload is
+  only logged by the exporter, never raised. `--verify-minutes` changes the
+  window.
+- After exit 4: if Langfuse is only slow to ingest, run again with
+  `--verify-only` and the same `--namespace`. It uploads nothing (the ids
+  are deterministic), re-reads, and with `--replace-session-traces`
+  deletes the old traces once everything is visible. If the upload really
+  failed, start over with a new `--namespace` and
+  `--replace-session-traces`; that also removes the partial upload.
+- `--replace-session-traces` then deletes the session's traces this hook
+  named `Claude Code Turn` that are not the backfill's own. Traces under
+  another name are never touched. With `--dry-run` it lists them instead.
+- The session id must be the transcript's own (file name and rows), and a
+  session with any file under its directory (agents, workflows) modified in
+  the last 30 minutes is refused unless `--force` is passed.
+
 ## Troubleshooting
 
 The hook explains nearly every failure in

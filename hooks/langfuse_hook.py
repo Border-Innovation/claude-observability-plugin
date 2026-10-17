@@ -12,6 +12,7 @@ Claude Code -> Langfuse hook
 
 import base64
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -47,6 +48,13 @@ CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true
 # whole batch (measured: 51 batches of 67-425 MB dropped re-sending one 165-turn
 # session). "false" sends each generation's own new input only, as before history.
 CAPTURE_HISTORY = (_opt("CC_LANGFUSE_CAPTURE_HISTORY") or "true").lower() == "true"
+# Observation ids derived from the trace id plus a stable key (message id,
+# tool_use id, agent id) instead of random ones. They let a later firing
+# attach children to an agent span that has not shipped yet, and make a
+# backfill's ids reproducible. They do NOT make a re-send free: Langfuse v4
+# reads do not merge two exports of one id, so every observation is still
+# exported exactly once.
+DETERMINISTIC_IDS = (_opt("CC_LANGFUSE_DETERMINISTIC_IDS") or "true").lower() == "true"
 OPERATOR_TAGS_VAR = "CC_LANGFUSE_TRACE_TAGS"
 try:
     MAX_CHARS = int(_opt("CC_LANGFUSE_MAX_CHARS") or "20000")
@@ -624,6 +632,25 @@ def sweep_stale_session_locks(state: Dict[str, Any], cutoff: datetime) -> None:
                 lock.unlink()
         except OSError:
             pass
+    try:
+        registries = [
+            f for pattern in ("langfuse_agents.*.json", "langfuse_agents.*.bak", "langfuse_agents.*.tmp")
+            for f in STATE_DIR.glob(pattern)
+        ]
+    except OSError:
+        return
+    stray_cutoff = time.time() - 24 * 3600
+    for registry in registries:
+        stem = registry.name[len("langfuse_agents."):].rsplit(".", 1)[0]
+        try:
+            mtime = registry.stat().st_mtime
+            if registry.suffix == ".tmp" and mtime < stray_cutoff:
+                # A save interrupted between write and rename.
+                registry.unlink()
+            elif len(stem) == 16 and stem not in live and mtime < cutoff.timestamp():
+                registry.unlink()
+        except OSError:
+            pass
 
 
 def save_hook_state(state: Dict[str, Any]) -> None:
@@ -665,12 +692,32 @@ def get_content_from_row(row: Dict[str, Any]) -> Any:
         return message.get("content")
     return row.get("content")
 
+# Row types that echo the API request Claude Code sent (since 2.1.301): a
+# request record, its system/shape, and one "blob" per request message. A blob
+# carries message.role "user"/"assistant" with neither id, usage nor timestamp,
+# so read as a chat row it starts phantom turns and zero-usage generations.
+REQUEST_ECHO_ROW_TYPE_PREFIX = "api-request"
+
+def is_request_echo_row(row: Any) -> bool:
+    if not isinstance(row, dict):
+        return False
+    row_type = row.get("type")
+    return isinstance(row_type, str) and row_type.startswith(REQUEST_ECHO_ROW_TYPE_PREFIX)
+
+def drop_request_echo_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [row for row in rows if not is_request_echo_row(row)]
+
 def get_user_or_assistant_role_from_row(row: Dict[str, Any]) -> Optional[str]:
     # Claude Code transcript row format is internal. Prefer top-level row.type
     # when it marks a chat row, then fall back to nested message.role.
     row_type = row.get("type")
     if row_type in ("user", "assistant"):
         return row_type
+    if isinstance(row_type, str) and row_type:
+        # A typed row of any other kind (attachment, queue-operation,
+        # api-request-blob, ...) is never a chat message, even when it embeds
+        # one; only untyped rows from older formats fall back to message.role.
+        return None
 
     message = row.get("message")
     if isinstance(message, dict):
@@ -942,7 +989,7 @@ def read_new_jsonl(transcript_path: Path, session_state: SessionState) -> Tuple[
         except Exception:
             continue
 
-    return msgs, session_state
+    return drop_request_echo_rows(msgs), session_state
 
 
 # ----------------- Turn assembly -----------------
@@ -979,21 +1026,37 @@ def _extract_xml_tag_value(text: str, tag: str) -> Optional[str]:
         return None
     return text[i + len(start):j]
 
+def get_task_notification_text(row: Dict[str, Any]) -> str:
+    """The text a notification row carries. A notification delivered while
+    the receiver is working arrives as an attachment row
+    ({"type": "queued_command", "prompt": "<task-notification>..."}); that is
+    how a subagent receives the results of the agents it launched."""
+    attachment = row.get("attachment")
+    if row.get("type") == "attachment" and isinstance(attachment, dict):
+        if attachment.get("type") == "queued_command":
+            prompt = attachment.get("prompt")
+            return prompt if isinstance(prompt, str) else extract_text_from_content(prompt)
+        return ""
+    return extract_text_from_content(get_content_from_row(row))
+
 def is_task_notification_row(row: Dict[str, Any]) -> bool:
+    if is_request_echo_row(row):
+        # A request blob repeats a delivered notification without its timestamp.
+        return False
     origin = row.get("origin")
     if isinstance(origin, dict) and origin.get("kind") == "task-notification":
         return True
 
-    notification_text = extract_text_from_content(get_content_from_row(row)).lstrip()
+    notification_text = get_task_notification_text(row).lstrip()
     return notification_text.startswith("<task-notification>")
 
 def get_tool_use_id_from_task_notification(row: Dict[str, Any]) -> Optional[str]:
-    notification_text = extract_text_from_content(get_content_from_row(row))
+    notification_text = get_task_notification_text(row)
     tool_use_id = _extract_xml_tag_value(notification_text, "tool-use-id")
     return tool_use_id.strip() if isinstance(tool_use_id, str) and tool_use_id.strip() else None
 
 def get_task_id_from_task_notification(row: Dict[str, Any]) -> Optional[str]:
-    notification_text = extract_text_from_content(get_content_from_row(row))
+    notification_text = get_task_notification_text(row)
     task_id = _extract_xml_tag_value(notification_text, "task-id")
     return task_id.strip() if isinstance(task_id, str) and task_id.strip() else None
 
@@ -1014,7 +1077,7 @@ def get_tool_use_id_for_task_notification(
     return None
 
 def get_result_from_task_notification(row: Dict[str, Any]) -> str:
-    notification_text = extract_text_from_content(get_content_from_row(row))
+    notification_text = get_task_notification_text(row)
     result = _extract_xml_tag_value(notification_text, "result")
     return result if result is not None else notification_text
 
@@ -1090,13 +1153,15 @@ def resolve_deferred_agent_turns(
 
     session_state.pending_task_notifications = stashed_notifications[-MAX_PENDING_TASK_NOTIFICATIONS:]
 
-    # Pop fully resolved turns in deferral (i.e. chronological) order.
+    # Pop fully resolved turns in deferral (i.e. chronological) order; a
+    # turn past the defer bound is popped too and ships as it is.
+    newest = get_latest_row_timestamp(rows)
     resolved_turn_row_lists: List[List[Dict[str, Any]]] = []
     still_pending: List[Dict[str, Any]] = []
     for pending_turn in session_state.pending_agent_turns:
         if not isinstance(pending_turn, dict) or not isinstance(pending_turn.get("rows"), list):
             continue
-        if pending_turn.get("pending_tool_use_ids"):
+        if pending_turn.get("pending_tool_use_ids") and not is_older_than_defer_bound(pending_turn["rows"], newest):
             still_pending.append(pending_turn)
             continue
         resolved_turn_row_lists.append(pending_turn["rows"])
@@ -1210,6 +1275,13 @@ def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[
     Queue remove rows carry no notification content and cannot be matched, so
     a removed notification keeps the gate closed until the turn ends — the
     safe direction (close-time emission is always correct).
+
+    Newer Claude Code versions do write the notification content on the
+    remove row. A notification for an agent launched BY a subagent is
+    enqueued on the main queue and removed at once (it is routed to that
+    subagent and never delivered here), so a remove row carrying the id
+    takes its entry off the queue; otherwise such a notification would
+    hold the main turn closed until it ends.
     """
     queued: List[str] = []
     delivered = set()
@@ -1220,6 +1292,10 @@ def get_undelivered_queued_notification_ids(rows: List[Dict[str, Any]]) -> List[
         if not tool_use_id:
             continue
         if row.get("type") == "queue-operation":
+            if row.get("operation") == "remove":
+                if tool_use_id in queued:
+                    queued.remove(tool_use_id)
+                continue
             queued.append(tool_use_id)
         else:
             delivered.add(tool_use_id)
@@ -1237,17 +1313,117 @@ def turn_has_unresolved_async_activity(turn: Turn) -> bool:
     )
 
 
+def get_stopped_task_id(row: Dict[str, Any]) -> Optional[str]:
+    """Task id a successful TaskStop result row stopped, or None. A stopped
+    task never notifies, so its launch would otherwise wait forever. A
+    failed stop comes back as an error string, not a dict."""
+    if not is_tool_result(row):
+        return None
+    tool_use_result = row.get("toolUseResult")
+    if not isinstance(tool_use_result, dict):
+        return None
+    task_id = tool_use_result.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    if any(block.get("is_error") is True for block in get_tool_result_blocks(get_content_from_row(row))):
+        return None
+    return task_id
+
+
+def get_launch_tool_use_ids_by_task_id(rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """task id -> launching tool_use id, from async launch results
+    (toolUseResult.taskId for workflows, agentId for agents,
+    backgroundTaskId for background shells)."""
+    out: Dict[str, str] = {}
+    for row in rows:
+        tool_use_result = row.get("toolUseResult") if isinstance(row, dict) else None
+        if not isinstance(tool_use_result, dict):
+            continue
+        task_id = (
+            tool_use_result.get("taskId")
+            or tool_use_result.get("agentId")
+            or tool_use_result.get("backgroundTaskId")
+        )
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        for block in get_tool_result_blocks(get_content_from_row(row)):
+            tool_use_id = block.get("tool_use_id")
+            if tool_use_id:
+                out[task_id] = str(tool_use_id)
+    return out
+
+
+def expand_task_stop_rows(
+    rows: List[Dict[str, Any]],
+    lookup_rows: List[Dict[str, Any]],
+    task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """After each successful TaskStop result, add a synthetic notification
+    resolving the stopped launch, so its turn stops waiting. Idempotent:
+    a TaskStop row already followed by its synthetic row is not expanded
+    again (held rows pass through here on every firing)."""
+    launches: Optional[Dict[str, str]] = None
+    done = {row.get("syntheticForUuid") for row in rows if isinstance(row, dict) and row.get("syntheticForUuid")}
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(row)
+        if not isinstance(row, dict) or row.get("syntheticForUuid"):
+            continue
+        task_id = get_stopped_task_id(row)
+        if task_id is None:
+            continue
+        marker = str(row.get("uuid") or f"taskstop:{task_id}")
+        if marker in done:
+            continue
+        if launches is None:
+            launches = get_launch_tool_use_ids_by_task_id(lookup_rows)
+        tool_use_id = launches.get(task_id) or (task_id_to_tool_use_id or {}).get(task_id)
+        if not tool_use_id:
+            continue
+        done.add(marker)
+        out.append({
+            "type": "user",
+            "timestamp": row.get("timestamp"),
+            "sessionId": row.get("sessionId"),
+            "syntheticForUuid": marker,
+            "origin": {"kind": "task-notification"},
+            "message": {"role": "user", "content": (
+                f"<task-notification>\n<task-id>{task_id}</task-id>\n<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                "<status>stopped</status>\n<result>Stopped with TaskStop.</result>\n</task-notification>"
+            )},
+        })
+    return out
+
+
+try:
+    MAX_DEFER_SECONDS = float(_opt("CC_LANGFUSE_MAX_DEFER_HOURS") or "12") * 3600
+except ValueError:
+    MAX_DEFER_SECONDS = 12 * 3600
+
+
+def get_latest_row_timestamp(rows: List[Dict[str, Any]]) -> Optional[datetime]:
+    return _get_latest_timestamp(*[parse_timestamp(row) for row in rows if isinstance(row, dict)])
+
+
+def is_older_than_defer_bound(rows: List[Dict[str, Any]], newest: Optional[datetime]) -> bool:
+    """A turn whose launch never notifies (killed, stopped from outside)
+    would wait for SessionEnd; past this age it ships as it is."""
+    latest = get_latest_row_timestamp(rows)
+    return newest is not None and latest is not None and (newest - latest).total_seconds() > MAX_DEFER_SECONDS
+
+
 def get_turns_to_emit(
     turns: List[Turn],
     session_state: SessionState,
     *,
     flush_deferred_agent_turns: bool = False,
+    newest_timestamp: Optional[datetime] = None,
 ) -> List[Turn]:
     turns_to_emit: List[Turn] = []
     for turn in turns:
         pending_agent_tool_use_ids = get_pending_agent_tool_use_ids(turn)
         if pending_agent_tool_use_ids:
-            if flush_deferred_agent_turns:
+            if flush_deferred_agent_turns or is_older_than_defer_bound(turn.rows, newest_timestamp):
                 debug(f"Emitting async agent turn without task notification: {pending_agent_tool_use_ids}")
                 turns_to_emit.append(turn)
                 continue
@@ -1305,6 +1481,11 @@ def add_tool_result_row(row: Dict[str, Any], state: TurnAssemblyState) -> bool:
                 tool_result_entry["is_error"] = tool_result_block["is_error"]
             if is_async_launch is not None:
                 tool_result_entry["is_async_launch"] = is_async_launch
+            background_task_id = (row.get("toolUseResult") or {}).get("backgroundTaskId") if isinstance(row.get("toolUseResult"), dict) else None
+            if isinstance(background_task_id, str) and background_task_id:
+                # A shell moved to the background (run_in_background, or a
+                # command that outlived its timeout); it notifies when done.
+                tool_result_entry["background_task_id"] = background_task_id
             if workflow_launch_marker is not None:
                 # Links the launching tool_use to its workflow run so emission
                 # can attach the run's agent transcripts (which have no
@@ -1456,14 +1637,18 @@ def assemble_turns(
     turns: List[Turn] = []
     state = TurnAssemblyState()
 
+    rows = expand_task_stop_rows(rows, rows, task_id_to_tool_use_id)
     for row in rows:
+        # Before the isMeta check: a subagent receives a notification as an
+        # isMeta user row ("[SYSTEM NOTIFICATION ...]" with origin kind
+        # task-notification), which the injected-context branch would eat.
+        if add_task_notification_row(row, state, task_id_to_tool_use_id, closed_turns=turns):
+            continue
+
         if add_injected_context_row(row, state):
             continue
 
         if add_tool_result_row(row, state):
-            continue
-
-        if add_task_notification_row(row, state, task_id_to_tool_use_id, closed_turns=turns):
             continue
 
         if add_interrupted_turn_row(row, state):
@@ -1615,6 +1800,12 @@ def get_new_turns_from_transcript(
         rows = held_rows + rows
         session_state.open_turn = {}
 
+    pending_rows = [
+        row for pending_turn in session_state.pending_agent_turns
+        if isinstance(pending_turn, dict) and isinstance(pending_turn.get("rows"), list)
+        for row in pending_turn["rows"]
+    ]
+    rows = expand_task_stop_rows(rows, pending_rows + rows, task_id_to_tool_use_id)
     deferred_turn_row_lists, rows = resolve_deferred_agent_turns(rows, session_state, task_id_to_tool_use_id)
 
     if flush_deferred_agent_turns and session_state.pending_agent_turns:
@@ -1681,7 +1872,7 @@ def get_agent_launch_tool_use_ids_by_name(transcript_path: Path) -> Dict[str, st
                     row = json.loads(line)
                 except Exception:
                     continue
-                if not isinstance(row, dict):
+                if not isinstance(row, dict) or is_request_echo_row(row):
                     continue
                 for tool_use in get_tool_use_blocks(get_content_from_row(row)):
                     tool_use_id = str(tool_use.get("id") or "")
@@ -1753,7 +1944,7 @@ def get_workflow_journal_results(run_dir: Path) -> Dict[str, Any]:
     one per completed agent; unparseable lines are skipped."""
     journal_path = run_dir / "journal.jsonl"
     try:
-        lines = journal_path.read_text(encoding="utf-8").splitlines()
+        lines = split_jsonl_lines(journal_path.read_text(encoding="utf-8"))
     except Exception:
         return {}
     results_by_agent_id: Dict[str, Any] = {}
@@ -1942,6 +2133,109 @@ def _build_forced_trace_context(trace_id_hex: str,
         debug(f"forced trace context for {trace_id_hex!r} failed: {e}")
         return None
 
+class DeterministicSpanIdGenerator:
+    """Wraps the tracer's OTel id generator: the next span id can be preset
+    (one shot); everything else is delegated to the wrapped generator."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.next_span_id: Optional[int] = None
+
+    def generate_span_id(self) -> int:
+        span_id, self.next_span_id = self.next_span_id, None
+        return span_id if span_id else self._inner.generate_span_id()
+
+    def generate_trace_id(self) -> int:
+        return self._inner.generate_trace_id()
+
+    def is_trace_id_random(self) -> bool:
+        is_random = getattr(self._inner, "is_trace_id_random", None)
+        return bool(is_random()) if callable(is_random) else True
+
+
+def install_deterministic_span_ids(langfuse: Any) -> Optional[DeterministicSpanIdGenerator]:
+    """Wrap the tracer's id generator once. Returns None (random ids stay)
+    when deterministic ids are off or the tracer exposes no id_generator
+    (a no-op tracer, an SDK that changed its internals)."""
+    if not DETERMINISTIC_IDS:
+        return None
+    tracer = getattr(langfuse, "_otel_tracer", None)
+    inner = getattr(tracer, "id_generator", None)
+    if inner is None:
+        return None
+    if isinstance(inner, DeterministicSpanIdGenerator):
+        return inner
+    try:
+        wrapper = DeterministicSpanIdGenerator(inner)
+        tracer.id_generator = wrapper
+        return wrapper
+    except Exception as e:
+        debug(f"deterministic span ids unavailable: {e}")
+        return None
+
+
+# Scope for observations without a natural id (an assistant message with no
+# message.id): their keys are positional, so the scope (agent id + turn
+# index) keeps two turns of one agent trace from deriving the same id.
+_ID_SCOPE: "contextvars.ContextVar[str]" = contextvars.ContextVar("cc_langfuse_id_scope", default="")
+
+
+@contextlib.contextmanager
+def id_scope(scope: str) -> Any:
+    token = _ID_SCOPE.set(scope)
+    try:
+        yield
+    finally:
+        _ID_SCOPE.reset(token)
+
+
+def derive_span_id(trace_id_hex: str, id_key: str) -> int:
+    """sha256(trace id + key)[:8 bytes] as a non-zero 64-bit span id."""
+    scope = _ID_SCOPE.get() if "noid:" in id_key else ""
+    seed = f"{trace_id_hex}:{scope}:{id_key}" if scope else f"{trace_id_hex}:{id_key}"
+    return int(hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16], 16) or 1
+
+
+def get_trace_id_hex_for_new_span(parent_otel_span: Any, forced_trace_id: Optional[str]) -> Optional[str]:
+    try:
+        if parent_otel_span is not None:
+            trace_id = parent_otel_span.get_span_context().trace_id
+            return f"{trace_id:032x}" if trace_id else None
+    except Exception:
+        return None
+    if forced_trace_id and _is_valid_trace_id_hex(forced_trace_id):
+        return forced_trace_id.lower()
+    return None
+
+
+def get_span_context_hex(otel_span: Any) -> Optional[Tuple[str, str]]:
+    """(trace id, span id) of an OTel span as hex, or None."""
+    try:
+        context = otel_span.get_span_context()
+        if not context.trace_id or not context.span_id:
+            return None
+        return f"{context.trace_id:032x}", f"{context.span_id:016x}"
+    except Exception:
+        return None
+
+
+def carrier_span(trace_id_hex: str, span_id_hex: str) -> Optional[Any]:
+    """A non-exporting stand-in for an already exported span, so children
+    emitted by a later firing nest under it."""
+    if not _is_valid_trace_id_hex(trace_id_hex) or not is_valid_span_id_hex(span_id_hex):
+        return None
+    try:
+        return otel_trace_api.NonRecordingSpan(otel_trace_api.SpanContext(
+            trace_id=int(trace_id_hex, 16),
+            span_id=int(span_id_hex, 16),
+            is_remote=False,
+            trace_flags=otel_trace_api.TraceFlags(0x01),
+        ))
+    except Exception as e:
+        debug(f"carrier span failed: {e}")
+        return None
+
+
 def _start_root_otel_span(langfuse: Langfuse, name: str, start_ns: Optional[int],
                           forced_trace_id: Optional[str],
                           forced_parent_span_id: Optional[str] = None) -> Any:
@@ -1960,8 +2254,12 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
                      as_root: bool = False,
                      forced_trace_id: Optional[str] = None,
                      forced_parent_span_id: Optional[str] = None,
+                     id_key: Optional[str] = None,
                      **obs_kwargs: Any) -> Any:
     """Create a Langfuse observation with an explicit OTel start_time.
+
+    With id_key set (and deterministic ids on), the observation id is
+    derive_span_id(trace id, id_key) rather than random.
 
     Bypasses langfuse.start_observation() (which has no start_time kwarg in
     SDK 4.x) by talking to the underlying OTel tracer directly and then
@@ -1983,11 +2281,20 @@ def _start_backdated(langfuse: Langfuse, *, name: str, as_type: str,
             f"pin with `pip install \"langfuse>=4.7,<5\"` or update the hook script."
         )
     start_ns = to_otel_nanoseconds(start_time)
-    if parent_otel_span is not None:
-        with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
-            otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
-    else:
-        otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id, forced_parent_span_id)
+    id_generator = install_deterministic_span_ids(langfuse) if id_key else None
+    if id_generator is not None:
+        trace_id_hex = get_trace_id_hex_for_new_span(parent_otel_span, forced_trace_id)
+        if trace_id_hex is not None:
+            id_generator.next_span_id = derive_span_id(trace_id_hex, id_key)
+    try:
+        if parent_otel_span is not None:
+            with otel_trace_api.use_span(parent_otel_span, end_on_exit=False):
+                otel_span = langfuse._otel_tracer.start_span(name=name, start_time=start_ns)
+        else:
+            otel_span = _start_root_otel_span(langfuse, name, start_ns, forced_trace_id, forced_parent_span_id)
+    finally:
+        if id_generator is not None:
+            id_generator.next_span_id = None
     if as_root:
         # SDK/server contract: spans under a synthetic trace-id carrier have a
         # parentSpanId that never exports, so the server only treats them as
@@ -2383,10 +2690,15 @@ class EmissionCursor:
     emitted: set
     completed_only: bool = False
     newly_emitted: List[str] = field(default_factory=list)
+    # Keys that are not complete whatever the caller computes (an agent's
+    # last message while it is still being written).
+    held: set = field(default_factory=set)
 
     def should_emit(self, key: str, complete: bool = True) -> bool:
         if key in self.emitted:
             return False
+        if key in self.held:
+            complete = False
         if self.completed_only and not complete:
             return False
         self.emitted.add(key)
@@ -2468,6 +2780,7 @@ def emit_single_tool_observation(
             as_type="tool",
             start_time=tool_use_timestamp,
             parent_otel_span=parent_otel_span,
+            id_key=tool_key,
             input=tool_input,
             metadata=tool_metadata,
             **get_status_kwargs(tool_result.status),
@@ -2502,6 +2815,12 @@ def emit_single_tool_observation(
                     subagent,
                     tool_use_timestamp,
                     subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                    workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+                    # A sync launch's tool_result is written when the agent is done.
+                    known_finished=(
+                        tool_result_entry is not None
+                        and not is_async_agent_launch_result(tool_result_entry)
+                    ),
                 )
 
     workflow_end_timestamp = None
@@ -2523,6 +2842,8 @@ def emit_single_tool_observation(
             workflow_resolved=workflow_resolved,
             cursor=cursor,
             emission_scope=tool_use_id or tool_key,
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
         )
 
     # Exported spans are immutable, so the end time set here must already
@@ -2718,6 +3039,7 @@ def emit_generation_observation(
     generation_name: str,
     start_timestamp: Optional[datetime],
     generation_kwargs: Dict[str, Any],
+    id_key: Optional[str] = None,
 ) -> Any:
     return _start_backdated(
         langfuse,
@@ -2725,6 +3047,7 @@ def emit_generation_observation(
         as_type="generation",
         start_time=start_timestamp,
         parent_otel_span=parent_otel_span,
+        id_key=id_key,
         **generation_kwargs,
     )
 
@@ -2777,6 +3100,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
             pending_subagent["subagent"],
             pending_subagent.get("display_start_timestamp") or pending_subagent.get("start_timestamp"),
             subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
         )
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_end_timestamp)
 
@@ -2839,6 +3163,7 @@ def emit_turn_observations(langfuse: Langfuse, parent_otel_span: Any, turn: Turn
                 generation_name=generation_name,
                 start_timestamp=generation_start_timestamp,
                 generation_kwargs=generation_kwargs,
+                id_key=generation_emission_key(assistant_index, assistant_message),
             )
         update_pending_subagent_display_start_after_launch_response(
             pending_subagents,
@@ -2912,6 +3237,8 @@ def emit_workflow_agent_observations(
     workflow_resolved: bool,
     cursor: EmissionCursor,
     emission_scope: str,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    workflow_agent_transcripts_by_run_id: Optional["WorkflowAgentTranscriptsByRunId"] = None,
 ) -> Optional[datetime]:
     """Emit each workflow-spawned agent transcript under the launching
     "Tool: Workflow" span.
@@ -2955,9 +3282,220 @@ def emit_workflow_agent_observations(
             # (no text in the final message); the journal result is the agent's
             # actual return value, so it becomes the span output instead of "".
             empty_output_fallback=agent_result_json,
+            # A workflow agent can launch agents and workflows of its own.
+            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+            workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+            known_finished=workflow_resolved or agent_result is not None,
         )
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, agent_end_timestamp)
     return latest_end_timestamp
+
+class AgentRegistry:
+    """Every agent span a session has emitted, with where it hangs and what
+    of its transcript is already exported.
+
+    An agent is not done when its launch first resolves: a background agent
+    that ends a turn while its own background work runs notifies "completed"
+    (an interim result), then resumes on that work's notifications and keeps
+    writing its transcript, launching more agents. Each firing re-emits every
+    registered agent whose transcript grew, under the parent it was first
+    emitted under, so late generations and late-launched agents (at any
+    depth) still arrive. Stored per session, beside the state file.
+    """
+
+    def __init__(self, path: Optional[Path] = None) -> None:
+        self.path = path
+        self.entries: Dict[str, Dict[str, Any]] = {}
+
+    @staticmethod
+    def _read(path: Path) -> Dict[str, Dict[str, Any]]:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("agents"), dict):
+            raise ValueError("no agents map")
+        return {k: v for k, v in data["agents"].items() if isinstance(k, str) and isinstance(v, dict)}
+
+    @classmethod
+    def load(cls, path: Optional[Path]) -> "AgentRegistry":
+        """Load the registry, falling back to the previous version (.bak).
+
+        Losing it cannot be repaired from the transcripts: what was already
+        exported is only known here, and re-sending would count twice. So a
+        lost registry means agents that grow later are not continued (their
+        late work is missing), never duplicated; that is logged loudly."""
+        registry = cls(path)
+        if path is None or not path.exists():
+            return registry
+        try:
+            registry.entries = cls._read(path)
+            return registry
+        except Exception as e:
+            first_error = f"{type(e).__name__}: {e}"
+        backup = path.with_suffix(".bak")
+        try:
+            registry.entries = cls._read(backup)
+            info(f"WARNING agent registry unreadable ({path}: {first_error}); using the previous "
+                 f"version. Agents that grew in the last firing may miss that firing's work.")
+        except Exception:
+            info(f"WARNING agent registry unreadable ({path}: {first_error}) and no usable backup; "
+                 f"agents emitted earlier in this session will not be continued.")
+        return registry
+
+    def save(self) -> None:
+        if self.path is None:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"agents": self.entries}, sort_keys=True), encoding="utf-8")
+            if self.path.exists():
+                os.replace(self.path, self.path.with_suffix(".bak"))
+            os.replace(tmp, self.path)
+        except Exception as e:
+            info(f"WARNING agent registry save failed ({self.path}): {type(e).__name__}: {e}")
+
+
+def get_agent_registry_path(session_state_key: str) -> Path:
+    return STATE_DIR / f"langfuse_agents.{session_state_key[:16]}.json"
+
+
+# The registry of the firing in progress; None outside one (one-shot emission
+# then keeps the old behavior: an agent is emitted once, as it is on disk).
+_ACTIVE_AGENT_REGISTRY: "contextvars.ContextVar[Optional[AgentRegistry]]" = contextvars.ContextVar(
+    "cc_langfuse_agent_registry", default=None
+)
+
+
+@contextlib.contextmanager
+def active_agent_registry(registry: Optional[AgentRegistry]) -> Any:
+    token = _ACTIVE_AGENT_REGISTRY.set(registry)
+    try:
+        yield
+    finally:
+        _ACTIVE_AGENT_REGISTRY.reset(token)
+
+
+def _get_file_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return time.time()
+
+
+def _get_file_size(path: Path) -> Optional[int]:
+    try:
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+# Set while a firing must ship everything (SessionEnd, backfill): agents that
+# have not settled are finalized as they are on disk.
+_FORCE_FINALIZE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "cc_langfuse_force_finalize", default=False
+)
+
+
+@contextlib.contextmanager
+def force_finalize(enabled: bool) -> Any:
+    token = _FORCE_FINALIZE.set(enabled)
+    try:
+        yield
+    finally:
+        _FORCE_FINALIZE.reset(token)
+
+
+# An agent transcript unchanged this long is treated as at rest even when its
+# last message never got a stop_reason (an agent killed mid-message).
+AGENT_IDLE_SETTLE_SECONDS = 30 * 60
+
+
+def get_streaming_message_key(turns: List[Turn]) -> Optional[str]:
+    """Emission key of the agent's last message if it may still be written.
+
+    A message is written as several rows sharing message.id; the earlier
+    rows carry partial usage and stop_reason null. Only the main
+    transcript is guaranteed complete at a Stop, so in an agent transcript
+    the LAST message is final only once its last row has a stop_reason. An
+    earlier message with a null stop_reason is final: a later message
+    exists."""
+    if not turns or not turns[-1].assistant_msgs:
+        return None
+    last_turn = turns[-1]
+    index = len(last_turn.assistant_msgs) - 1
+    last_message = last_turn.assistant_msgs[index]
+    message = last_message.get("message")
+    if isinstance(message, dict) and "stop_reason" in message and message.get("stop_reason") is None:
+        return generation_emission_key(index, last_message)
+    return None
+
+
+def agent_is_settled(turns: List[Turn]) -> bool:
+    """True when the agent transcript, as it is now, ends at rest: no async
+    launch without its notification, no queued notification undelivered, no
+    tool_use without its result, and a last message that is not a tool call.
+    Nothing it already wrote can then change, so every observation can ship
+    in final form. An agent can still be resumed later (a new message to
+    it); what it writes then is new observations, never old ones changed."""
+    if not turns:
+        return False
+    for turn in turns:
+        if turn_has_unresolved_async_activity(turn) or get_running_background_shell_ids(turn):
+            return False
+    last_turn = turns[-1]
+    for assistant_message in last_turn.assistant_msgs:
+        for tool_use in get_tool_use_blocks(get_content_from_row(assistant_message)):
+            if str(tool_use.get("id") or "") not in last_turn.tool_results_by_id:
+                return False
+    last_message = last_turn.assistant_msgs[-1].get("message")
+    if isinstance(last_message, dict) and last_message.get("stop_reason") == "tool_use":
+        return False
+    if get_streaming_message_key(turns) is not None:
+        return False
+    return True
+
+
+def agent_is_settled_but_for_streaming(turns: List[Turn]) -> bool:
+    """agent_is_settled, ignoring only a last message that never got its
+    stop_reason (used once the transcript has been idle for a long time)."""
+    if not turns:
+        return False
+    if any(turn_has_unresolved_async_activity(turn) or get_running_background_shell_ids(turn) for turn in turns):
+        return False
+    return True
+
+
+def get_running_background_shell_ids(turn: Turn) -> List[str]:
+    """Background shells of the turn with no notification yet. Counted only
+    when deciding whether an AGENT is at rest (its span ships once, so it
+    must not ship before the shell's notification wakes the agent); main
+    turns keep their own gate."""
+    return [
+        tool_use_id for tool_use_id, entry in turn.tool_results_by_id.items()
+        if isinstance(entry, dict) and entry.get("background_task_id") and entry.get("final_content") is None
+    ]
+
+
+def agent_entry_needs_visit(entry: Dict[str, Any], size: Optional[int], force: bool,
+                            path: Optional[Path] = None) -> bool:
+    """A registered agent is re-read when its transcript grew, when it is
+    not at rest yet (an idle bound may settle it although nothing changed),
+    when it holds a message back, or, at SessionEnd, when its span has not
+    shipped."""
+    if size is None:
+        return False
+    if size != entry.get("size"):
+        return True
+    if force:
+        return bool(entry.get("unsettled") or entry.get("held") or not entry.get("span_exported"))
+    if entry.get("unsettled") or entry.get("held"):
+        # Unchanged on disk: only an idle bound can settle it, so wait until
+        # that bound is due instead of re-reading it every firing.
+        bound = entry.get("idle_bound_s")
+        if not isinstance(bound, (int, float)) or path is None:
+            return True
+        return time.time() - _get_file_mtime(path) > bound
+    return False
+
 
 def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
                                subagent: Dict[str, Any],
@@ -2967,20 +3505,59 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
                                generation_name: str = "Subagent LLM Call",
                                empty_output_fallback: Optional[str] = None,
                                subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+                               workflow_agent_transcripts_by_run_id: Optional["WorkflowAgentTranscriptsByRunId"] = None,
+                               known_finished: bool = False,
                                ) -> Optional[datetime]:
+    """Emit one agent transcript under parent_otel_span.
+
+    known_finished: the caller holds proof the agent is done (a sync launch's
+    tool_result, a workflow journal result), which agent_is_settled cannot
+    see from the transcript alone (a workflow agent ends on a bare
+    StructuredOutput call).
+
+    Inside a firing with an agent registry, every observation is exported
+    exactly once, in final form: Langfuse v4 does not merge two exports of
+    one id at read time, so a re-send would count twice. While the agent
+    still runs, only observations that can no longer change ship; the agent
+    span itself ships once, when the agent settles (or at SessionEnd). Its
+    id is deterministic, so children exported earlier already point at it.
+    Without a registry, or without deterministic ids, the agent ships in one
+    pass as it is on disk (the previous behavior).
+    """
     path = subagent.get("path")
     if not isinstance(path, Path):
         return start_timestamp
+    agent_id = subagent.get("agent_id")
+    if not isinstance(agent_id, str) or not agent_id:
+        agent_id = path.stem
+
+    registry = _ACTIVE_AGENT_REGISTRY.get()
+    entry = registry.entries.get(agent_id) if registry is not None else None
+    force = _FORCE_FINALIZE.get()
+    size = _get_file_size(path)
+    if entry is not None and size is not None and not agent_entry_needs_visit(entry, size, force, path):
+        # Nothing new on disk, and nothing left to finalize.
+        return parse_timestamp(entry.get("end")) or start_timestamp
+
     rows = read_subagent_jsonl(path)
     if rows is None:
         return start_timestamp
 
-    turns = build_turns(rows)
+    # Notifications inside the agent's transcript may carry only a task id:
+    # agents' ids come from the metas, shells' and workflows' from the
+    # agent's own launch results.
+    task_id_map = get_launch_tool_use_ids_by_task_id(rows)
+    task_id_map.update(get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id))
+    turns = build_turns(rows, task_id_map)
     if not turns:
         return start_timestamp
 
     first_turn = turns[0]
-    subagent_start_timestamp = start_timestamp or parse_timestamp(first_turn.user_msg)
+    # The agent span keeps the start it was first seen with.
+    stored_start_timestamp = parse_timestamp(entry.get("start")) if entry else None
+    subagent_start_timestamp = (
+        stored_start_timestamp or start_timestamp or parse_timestamp(first_turn.user_msg)
+    )
     subagent_input_text, subagent_input_meta = truncate_text(extract_text_from_content(get_content_from_row(first_turn.user_msg)))
 
     last_turn = turns[-1]
@@ -3003,50 +3580,201 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     }
     if extra_metadata:
         subagent_metadata.update(extra_metadata)
-    subagent_span = _start_backdated(
-        langfuse,
+    span_kwargs: Dict[str, Any] = dict(
         name=span_name,
         as_type="span",
         start_time=subagent_start_timestamp,
-        parent_otel_span=parent_otel_span,
+        id_key=f"agent:{agent_id}",
         input={"role": "user", "content": subagent_input_text},
         metadata=subagent_metadata,
         **get_status_kwargs(get_worst_turn_status(turns)),
     )
 
+    # Where the agent hangs: the parent it was first emitted under.
+    if entry is not None and entry.get("trace_id") and entry.get("parent_span_id"):
+        parent_ids: Optional[Tuple[str, str]] = (str(entry["trace_id"]), str(entry["parent_span_id"]))
+    else:
+        parent_ids = get_span_context_hex(parent_otel_span) if parent_otel_span is not None else None
+    incremental = (
+        registry is not None
+        and parent_ids is not None
+        and size is not None
+        and install_deterministic_span_ids(langfuse) is not None
+    )
+
+    subagent_span = None
+    if incremental:
+        trace_id_hex, parent_span_id_hex = parent_ids
+        agent_span_id_hex = f"{derive_span_id(trace_id_hex, f'agent:{agent_id}'):016x}"
+        children_parent = carrier_span(trace_id_hex, agent_span_id_hex)
+        idle_seconds = 0.0
+        try:
+            idle_seconds = time.time() - path.stat().st_mtime
+        except OSError:
+            pass
+        streaming_key = get_streaming_message_key(turns)
+        settled = (
+            force
+            or known_finished
+            or agent_is_settled(turns)
+            # Killed mid-message: the last message never gets its stop_reason.
+            or (idle_seconds > AGENT_IDLE_SETTLE_SECONDS and streaming_key is not None
+                and agent_is_settled_but_for_streaming(turns))
+            # Killed while waiting on a launch that will never notify; the
+            # same bound as a waiting main turn.
+            or idle_seconds > MAX_DEFER_SECONDS
+        )
+        cursor = EmissionCursor(
+            emitted=set(k for k in (entry or {}).get("emitted", []) if isinstance(k, str)),
+            completed_only=not settled,
+            held={streaming_key} if streaming_key is not None and not settled else set(),
+        )
+    else:
+        settled = True
+        subagent_span = _start_backdated(langfuse, parent_otel_span=parent_otel_span, **span_kwargs)
+        children_parent = subagent_span._otel_span
+        cursor = fresh_cursor()
+
     latest_end_timestamp = subagent_start_timestamp
     previous_start_timestamp = subagent_start_timestamp
-    # The agent transcript is complete on disk, so history accumulates
-    # across its turns the same way as in the main conversation.
+    # History accumulates across the agent's turns the same way as in the
+    # main conversation.
     subagent_history: List[Dict[str, Any]] = []
-    for turn in turns:
-        latest_turn_timestamp = emit_turn_observations(
-            langfuse,
-            subagent_span._otel_span,
-            turn,
-            previous_start_timestamp,
-            generation_name=generation_name,
-            # Agents launched by this agent are listed in the same map.
-            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
-            history_prefix=list(subagent_history),
-        )
+    for turn_index, turn in enumerate(turns):
+        with id_scope(f"{agent_id}:{turn_index}"):
+            latest_turn_timestamp = emit_turn_observations(
+                langfuse,
+                children_parent,
+                turn,
+                previous_start_timestamp,
+                generation_name=generation_name,
+                # Agents launched by this agent are listed in the same map.
+                subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                cursor=cursor,
+                workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+                history_prefix=list(subagent_history),
+            )
         subagent_history.extend(build_turn_history_messages(turn))
         latest_end_timestamp = _get_latest_timestamp(latest_end_timestamp, latest_turn_timestamp)
         if latest_turn_timestamp is not None:
             previous_start_timestamp = latest_turn_timestamp
 
-    subagent_span.update(output={"role": "assistant", "content": subagent_output_text})
-    subagent_span.end(
-        end_time=to_otel_nanoseconds(
-            _get_latest_timestamp(latest_end_timestamp, subagent_start_timestamp)
+    subagent_end_timestamp = _get_latest_timestamp(latest_end_timestamp, subagent_start_timestamp)
+    span_exported = bool(entry and entry.get("span_exported"))
+    if incremental and settled and not span_exported:
+        subagent_span = _start_backdated(
+            langfuse,
+            parent_otel_span=carrier_span(parent_ids[0], parent_ids[1]),
+            **span_kwargs,
         )
-    )
+        span_exported = True
+    if subagent_span is not None:
+        subagent_span.update(output={"role": "assistant", "content": subagent_output_text})
+        subagent_span.end(end_time=to_otel_nanoseconds(subagent_end_timestamp))
+
+    if incremental:
+        registry.entries[agent_id] = {
+            "path": str(path),
+            "trace_id": parent_ids[0],
+            "parent_span_id": parent_ids[1],
+            "size": size,
+            "span_exported": span_exported,
+            # Re-visited every firing while set (see agent_entry_needs_visit).
+            "unsettled": not settled,
+            "held": sorted(cursor.held),
+            "idle_bound_s": (
+                AGENT_IDLE_SETTLE_SECONDS if streaming_key is not None else MAX_DEFER_SECONDS
+            ) if not settled else None,
+            "start": subagent_start_timestamp.isoformat() if subagent_start_timestamp else None,
+            "end": subagent_end_timestamp.isoformat() if subagent_end_timestamp else None,
+            "emitted": sorted(cursor.emitted),
+            "span_name": span_name,
+            "generation_name": generation_name,
+            # The journal result is re-read on refresh; storing it would only
+            # grow the registry.
+            "extra_metadata": {
+                k: v for k, v in (extra_metadata or {}).items() if k != "workflow_agent_result"
+            },
+            "agent_type": subagent.get("agent_type"),
+            "description": description,
+        }
 
     return latest_end_timestamp
 
+
+def refresh_grown_agents(
+    langfuse: Langfuse,
+    registry: AgentRegistry,
+    *,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+    workflow_agent_transcripts_by_run_id: Optional["WorkflowAgentTranscriptsByRunId"] = None,
+) -> int:
+    """Continue every registered agent whose transcript grew since the last
+    firing (and, at SessionEnd, every agent whose span has not shipped yet),
+    under the span it was first emitted under. Only observations not yet
+    exported ship; agents launched late by these agents are found by the
+    walk and emitted at their first sight."""
+    refreshed = 0
+    force = _FORCE_FINALIZE.get()
+    with active_agent_registry(registry):
+        for agent_id, entry in list(registry.entries.items()):
+            path = Path(str(entry.get("path") or ""))
+            size = _get_file_size(path)
+            if not agent_entry_needs_visit(entry, size, force, path):
+                continue
+            parent = carrier_span(str(entry.get("trace_id") or ""), str(entry.get("parent_span_id") or ""))
+            if parent is None:
+                continue
+            extra_metadata = dict(entry.get("extra_metadata") or {})
+            empty_output_fallback = None
+            known_finished = False
+            run_id = extra_metadata.get("workflow_run_id")
+            if isinstance(run_id, str) and run_id:
+                result = get_workflow_journal_results(path.parent).get(agent_id)
+                known_finished = result is not None
+                if result is not None:
+                    empty_output_fallback, _ = truncate_text(json.dumps(result, ensure_ascii=False))
+                    extra_metadata["workflow_agent_result"] = empty_output_fallback
+            try:
+                emit_subagent_observations(
+                    langfuse,
+                    parent,
+                    {
+                        "path": path,
+                        "agent_id": agent_id,
+                        "agent_type": entry.get("agent_type"),
+                        "description": entry.get("description"),
+                    },
+                    # The stored start is applied inside, from the entry.
+                    None,
+                    span_name=entry.get("span_name") if isinstance(entry.get("span_name"), str) else None,
+                    extra_metadata=extra_metadata,
+                    generation_name=str(entry.get("generation_name") or "Subagent LLM Call"),
+                    empty_output_fallback=empty_output_fallback,
+                    subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                    workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+                    known_finished=known_finished,
+                )
+                refreshed += 1
+            except Exception as e:
+                info(f"continuing grown agent {agent_id} failed: {type(e).__name__}: {e}")
+            # One agent at a time, like a backlog of turns: keeps the span queue bounded.
+            flush_langfuse_client(langfuse)
+    if refreshed:
+        debug(f"Continued {refreshed} grown agent transcript(s)")
+    return refreshed
+
+
+def split_jsonl_lines(text: str) -> List[str]:
+    """Split JSONL on newline only. str.splitlines() also breaks on U+2028,
+    U+2029, U+0085, form feed and friends, which JSON strings may carry raw:
+    the halves fail to parse and the whole row (an assistant message with
+    its final usage, say) is silently dropped."""
+    return text.split("\n")
+
 def read_subagent_jsonl(path: Path) -> Optional[List[Dict[str, Any]]]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = split_jsonl_lines(path.read_text(encoding="utf-8"))
     except Exception as e:
         info(f"transcript read failed ({path}): {type(e).__name__}: {e}")
         return None
@@ -3063,6 +3791,8 @@ def read_subagent_jsonl(path: Path) -> Optional[List[Dict[str, Any]]]:
             continue
         if not isinstance(row, dict):
             info(f"transcript line skipped ({path}:{line_number}): expected JSON object")
+            continue
+        if is_request_echo_row(row):
             continue
         rows.append(row)
     return rows
@@ -3139,6 +3869,18 @@ def is_valid_span_id_hex(span_id: Any) -> bool:
     )
 
 
+# Set only by the backfill: re-uploaded turns land in traces of their own, so
+# they can never mix with the observations a live firing put in the original
+# traces (random-id ones from older versions included).
+TRACE_SEED_NAMESPACE: Optional[str] = None
+
+
+def turn_trace_seed(session_id: str, user_row_uuid: str) -> str:
+    if TRACE_SEED_NAMESPACE:
+        return f"{TRACE_SEED_NAMESPACE}:{session_id}:{user_row_uuid}"
+    return f"{session_id}:{user_row_uuid}"
+
+
 def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
                   root_span_id: Optional[str] = None,
                   trace_id: Optional[str] = None) -> Optional[Any]:
@@ -3168,7 +3910,7 @@ def remote_parent(langfuse: Langfuse, session_id: str, user_row_uuid: Any,
         trace_id = None
     try:
         if trace_id is None:
-            trace_id = langfuse.create_trace_id(seed=f"{session_id}:{user_row_uuid}")
+            trace_id = langfuse.create_trace_id(seed=turn_trace_seed(session_id, user_row_uuid))
         parent_context = otel_trace_api.SpanContext(
             trace_id=int(trace_id, 16),
             span_id=int(root_span_id, 16) if root_span_id else (random.getrandbits(64) or 1),
@@ -3215,6 +3957,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
             forced_trace_id=parent_trace_id,
             forced_parent_span_id=parent_span_id,
             as_root=False,
+            id_key=f"root:{turn.user_msg.get('uuid') or turn_num}",
             input=root_input,
             metadata=trace_metadata,
             **get_status_kwargs(get_turn_status(turn)),
@@ -3234,6 +3977,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         parent_otel_span=None if forced_trace_id else remote_parent(langfuse, session_id, turn.user_msg.get("uuid")),
         forced_trace_id=forced_trace_id,
         as_root=True,
+        id_key=f"root:{turn.user_msg.get('uuid') or turn_num}",
         input=root_input,
         metadata=trace_metadata,
         **get_status_kwargs(get_turn_status(turn)),
@@ -3484,49 +4228,48 @@ def emit_ready_observations_of_open_turn(
     except Exception as e:
         info(f"emitting ready observations of open turn failed: {type(e).__name__}: {e}")
 
-def emit_new_turns_from_transcript(
+def emit_session_firing(
     langfuse: Langfuse,
     config: LangfuseConfig,
     session_id: str,
     transcript_path: Path,
+    session_state: SessionState,
+    agent_registry: AgentRegistry,
     *,
     flush_deferred_agent_turns: bool = False,
 ) -> int:
-    key = get_session_state_key(session_id, str(transcript_path))
+    """One firing's emission over the given state: new turns, the ready part
+    of the open turn, then every registered agent whose transcript grew."""
+    subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
+    if subagent_transcripts_by_tool_use_id:
+        debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
 
-    with FileLock(get_session_lock_path(key)):
-        with FileLock(LOCK_FILE):
-            state = load_hook_state()
-        session_state = get_session_state(state, key)
+    workflow_agent_transcripts_by_run_id = WorkflowAgentTranscriptsByRunId(transcript_path)
 
-        subagent_transcripts_by_tool_use_id = get_subagent_transcripts_by_tool_use_id(transcript_path)
-        if subagent_transcripts_by_tool_use_id:
-            debug(f"Discovered {len(subagent_transcripts_by_tool_use_id)} subagent transcript(s)")
+    turns, session_state = get_new_turns_from_transcript(
+        transcript_path,
+        session_state,
+        subagent_transcripts_by_tool_use_id,
+        flush_deferred_agent_turns=flush_deferred_agent_turns,
+        session_id=session_id,
+    )
 
-        workflow_agent_transcripts_by_run_id = WorkflowAgentTranscriptsByRunId(transcript_path)
-
-        turns, session_state = get_new_turns_from_transcript(
+    # One full-file pass per firing serves every turn emitted below.
+    session_history = None
+    if CAPTURE_HISTORY and (turns or session_state.open_turn):
+        session_history = build_session_history(
             transcript_path,
-            session_state,
-            subagent_transcripts_by_tool_use_id,
-            flush_deferred_agent_turns=flush_deferred_agent_turns,
-            session_id=session_id,
+            get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
         )
 
-        # One full-file pass per firing serves every turn emitted below.
-        session_history = None
-        if CAPTURE_HISTORY and (turns or session_state.open_turn):
-            session_history = build_session_history(
-                transcript_path,
-                get_task_id_to_tool_use_id(subagent_transcripts_by_tool_use_id),
-            )
-
-        emitted = 0
+    emitted = 0
+    with active_agent_registry(agent_registry), force_finalize(flush_deferred_agent_turns):
         if turns:
             turns_to_emit = get_turns_to_emit(
                 turns,
                 session_state,
                 flush_deferred_agent_turns=flush_deferred_agent_turns,
+                newest_timestamp=get_latest_row_timestamp([r for t in turns for r in t.rows]),
             )
             emitted = emit_and_close_ready_turns(
                 langfuse,
@@ -3561,10 +4304,60 @@ def emit_new_turns_from_transcript(
             session_history=session_history,
         )
 
+    if config.parent_context is None:
+        attribute_propagation = propagate_attributes(
+            session_id=session_id,
+            user_id=config.user_id,
+            trace_name=TRACE_NAME,
+        )
+    else:
+        attribute_propagation = contextlib.nullcontext()
+    try:
+        with attribute_propagation, force_finalize(flush_deferred_agent_turns):
+            refresh_grown_agents(
+                langfuse,
+                agent_registry,
+                subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+            )
+    except Exception as e:
+        info(f"refreshing grown agents failed: {type(e).__name__}: {e}")
+    return emitted
+
+
+def emit_new_turns_from_transcript(
+    langfuse: Langfuse,
+    config: LangfuseConfig,
+    session_id: str,
+    transcript_path: Path,
+    *,
+    flush_deferred_agent_turns: bool = False,
+) -> int:
+    key = get_session_state_key(session_id, str(transcript_path))
+
+    with FileLock(get_session_lock_path(key)):
+        with FileLock(LOCK_FILE):
+            state = load_hook_state()
+        session_state = get_session_state(state, key)
+        # Per-session file under the session lock: it can be large, and the
+        # shared state file is rewritten by every session's firing.
+        agent_registry = AgentRegistry.load(get_agent_registry_path(key))
+
+        emitted = emit_session_firing(
+            langfuse,
+            config,
+            session_id,
+            transcript_path,
+            session_state,
+            agent_registry,
+            flush_deferred_agent_turns=flush_deferred_agent_turns,
+        )
+
         # Known limitation (accepted, like the crash-between-emit-and-save
         # duplicate window): progress is persisted before the SDK flush in
         # main(); a dropped flush leaves emitted_keys pointing at spans that
         # never reached the server.
+        agent_registry.save()
         with FileLock(LOCK_FILE):
             state = load_hook_state()
             save_session_state(state, key, session_state)
@@ -3591,6 +4384,447 @@ def flush_and_shutdown_langfuse_client(langfuse: Optional[Langfuse]) -> None:
         t.join(FLUSH_TIMEOUT_S)
     except Exception:
         pass
+
+
+# ----------------- Backfill -----------------
+DEFAULT_BACKFILL_NAMESPACE = "backfill-v1"
+
+
+class _RandomIds:
+    def generate_span_id(self) -> int:
+        return random.getrandbits(64) or 1
+
+    def generate_trace_id(self) -> int:
+        return random.getrandbits(128) or 1
+
+    def is_trace_id_random(self) -> bool:
+        return True
+
+
+class _RecordingTracer:
+    """Dry-run tracer: real OTel span contexts (so nesting and trace ids
+    behave as in a live run), nothing recorded or exported by OTel."""
+
+    def __init__(self) -> None:
+        self.id_generator: Any = _RandomIds()
+        self.names: Dict[int, str] = {}
+        self.parents: Dict[int, int] = {}
+
+    def start_span(self, *, name: str, start_time: Optional[int] = None, context: Any = None) -> Any:
+        parent_context = otel_trace_api.get_current_span(context).get_span_context()
+        span_id = self.id_generator.generate_span_id()
+        if parent_context is not None and parent_context.is_valid:
+            trace_id = parent_context.trace_id
+            self.parents[span_id] = parent_context.span_id
+        else:
+            trace_id = self.id_generator.generate_trace_id()
+        self.names[span_id] = name
+        # NonRecordingSpan is an OTel Span, so use_span/get_current_span
+        # accept it as a parent for the next span.
+        return otel_trace_api.NonRecordingSpan(otel_trace_api.SpanContext(
+            trace_id=trace_id, span_id=span_id, is_remote=False,
+            trace_flags=otel_trace_api.TraceFlags(0x01),
+        ))
+
+
+class _RecordedObservation:
+    def __init__(self, recorder: "RecordingLangfuse", otel_span: Any, as_type: str,
+                 kwargs: Dict[str, Any]) -> None:
+        self._recorder = recorder
+        self._otel_span = otel_span
+        context = otel_span.get_span_context()
+        self.id = f"{context.span_id:016x}"
+        self.trace_id = f"{context.trace_id:032x}"
+        self.name = recorder._otel_tracer.names.get(context.span_id, "")
+        self.as_type = as_type
+        self.usage_details = kwargs.get("usage_details")
+        metadata = kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else {}
+        self.transcript_path = metadata.get("transcript_path") if as_type == "span" else None
+        recorder.record(self)
+
+    def update(self, **kwargs: Any) -> None:
+        if "usage_details" in kwargs:
+            self.usage_details = kwargs["usage_details"]
+
+    def end(self, *, end_time: Optional[int] = None) -> None:
+        pass
+
+
+class RecordingLangfuse:
+    """Stands in for the Langfuse client in a dry run: every observation the
+    emission would export is recorded by id instead of sent. An id seen twice
+    is a replacement on the server, never a second observation."""
+
+    def __init__(self) -> None:
+        self._otel_tracer = _RecordingTracer()
+        self.by_id: Dict[str, _RecordedObservation] = {}
+        self.emissions = 0
+
+    @staticmethod
+    def create_trace_id(*, seed: Optional[str] = None) -> str:
+        return Langfuse.create_trace_id(seed=seed)
+
+    def record(self, observation: _RecordedObservation) -> None:
+        self.emissions += 1
+        self.by_id[observation.id] = observation
+
+    def _create_observation_from_otel_span(self, *, otel_span: Any, as_type: str, **kwargs: Any) -> Any:
+        return _RecordedObservation(self, otel_span, as_type, kwargs)
+
+    def flush(self) -> None:
+        pass
+
+    def summary(self) -> Dict[str, Any]:
+        usage: Dict[str, int] = {}
+        generations = 0
+        zero_usage_generations = 0
+        traces = set()
+        for observation in self.by_id.values():
+            traces.add(observation.trace_id)
+            if observation.as_type != "generation":
+                continue
+            generations += 1
+            if not observation.usage_details:
+                zero_usage_generations += 1
+                continue
+            for k, v in observation.usage_details.items():
+                usage[k] = usage.get(k, 0) + int(v)
+        return {
+            "observations": len(self.by_id),
+            "emissions": self.emissions,
+            "traces": len(traces),
+            "generations": generations,
+            "zero_usage_generations": zero_usage_generations,
+            "usage": usage,
+        }
+
+    def per_agent(self) -> Dict[str, Dict[str, Any]]:
+        """Generations and usage per agent transcript (main = the session)."""
+        tracer = self._otel_tracer
+        agent_of_span: Dict[int, str] = {}
+        for observation in self.by_id.values():
+            if observation.transcript_path and observation.name.startswith(("Subagent", "Workflow agent")):
+                agent_of_span[int(observation.id, 16)] = observation.transcript_path
+
+        def owner(span_id: int) -> str:
+            seen = 0
+            while span_id in tracer.parents and seen < 1000:
+                span_id = tracer.parents[span_id]
+                if span_id in agent_of_span:
+                    return agent_of_span[span_id]
+                seen += 1
+            return "main"
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for observation in self.by_id.values():
+            if observation.as_type != "generation":
+                continue
+            entry = out.setdefault(owner(int(observation.id, 16)), {"generations": 0, "zero": 0, "usage": {}})
+            entry["generations"] += 1
+            if not observation.usage_details:
+                entry["zero"] += 1
+            for k, v in (observation.usage_details or {}).items():
+                entry["usage"][k] = entry["usage"].get(k, 0) + int(v)
+        for path in agent_of_span.values():
+            out.setdefault(path, {"generations": 0, "zero": 0, "usage": {}})
+        return out
+
+
+def get_backfill_trace_ids(langfuse: Any, session_id: str, transcript_path: Path) -> set:
+    """Trace ids the backfill gives the turns of this transcript."""
+    trace_ids = set()
+    rows = read_subagent_jsonl(transcript_path) or []
+    for row in rows:
+        uuid = row.get("uuid")
+        if get_user_or_assistant_role_from_row(row) == "user" and isinstance(uuid, str) and uuid:
+            trace_ids.add(langfuse.create_trace_id(seed=turn_trace_seed(session_id, uuid)))
+    return trace_ids
+
+
+def list_session_traces(langfuse: Any, session_id: str, *, with_observations: bool = False) -> List[Tuple[Any, ...]]:
+    """(id, name[, observation ids]) of every trace Langfuse holds for the
+    session (read-only)."""
+    traces_out: List[Tuple[Any, ...]] = []
+    page = 1
+    fields = "core,observations" if with_observations else "core"
+    while True:
+        traces = langfuse.api.trace.list(session_id=session_id, page=page, limit=100, fields=fields)
+        data = list(getattr(traces, "data", None) or [])
+        for trace in data:
+            trace_id = getattr(trace, "id", None)
+            if not trace_id:
+                continue
+            if with_observations:
+                traces_out.append((trace_id, getattr(trace, "name", None), set(getattr(trace, "observations", None) or [])))
+            else:
+                traces_out.append((trace_id, getattr(trace, "name", None)))
+        total_pages = getattr(getattr(traces, "meta", None), "total_pages", None) or page
+        if not data or page >= total_pages:
+            break
+        page += 1
+    return traces_out
+
+
+def plan_trace_replacement(
+    traces: List[Tuple[str, Optional[str]]], keep: set,
+) -> Dict[str, List[str]]:
+    """Split the session's traces: this hook's earlier turn traces (to
+    delete), the backfill's own (kept), and anything another emitter put
+    under the same session id (never touched)."""
+    plan: Dict[str, List[str]] = {"delete": [], "keep": [], "foreign": []}
+    for item in traces:
+        trace_id, name = item[0], item[1]
+        if trace_id in keep:
+            plan["keep"].append(trace_id)
+        elif name == TRACE_NAME:
+            plan["delete"].append(trace_id)
+        else:
+            plan["foreign"].append(trace_id)
+    return plan
+
+
+BACKFILL_VERIFY_ATTEMPTS = 40
+BACKFILL_VERIFY_INTERVAL_S = 15.0
+
+
+def record_uploaded_observation_ids(langfuse: Any) -> Dict[str, set]:
+    """Wrap the client so every observation the backfill creates is noted
+    per trace: the read-back compares the server against exactly this."""
+    expected: Dict[str, set] = {}
+    create = langfuse._create_observation_from_otel_span
+
+    def recording_create(*args: Any, **kwargs: Any) -> Any:
+        observation = create(*args, **kwargs)
+        trace_id, observation_id = getattr(observation, "trace_id", None), getattr(observation, "id", None)
+        if trace_id and observation_id:
+            expected.setdefault(trace_id, set()).add(observation_id)
+        return observation
+
+    langfuse._create_observation_from_otel_span = recording_create
+    return expected
+
+
+def verify_upload(langfuse: Any, session_id: str, expected: Dict[str, set]) -> Dict[str, int]:
+    """Read back until every uploaded observation is visible, or give up.
+
+    flush() does not raise on a rejected batch (the exporter only logs it),
+    so this is the only proof the upload landed. Returns missing observation
+    counts per trace; empty means verified."""
+    missing: Dict[str, int] = {t: len(ids) for t, ids in expected.items()}
+    for attempt in range(max(1, BACKFILL_VERIFY_ATTEMPTS)):
+        present = {item[0]: item[2] for item in list_session_traces(langfuse, session_id, with_observations=True)}
+        missing = {
+            trace_id: len(ids - present.get(trace_id, set()))
+            for trace_id, ids in expected.items()
+            if ids - present.get(trace_id, set())
+        }
+        if not missing:
+            return {}
+        if attempt + 1 < BACKFILL_VERIFY_ATTEMPTS:
+            time.sleep(BACKFILL_VERIFY_INTERVAL_S)
+    return missing
+
+
+def delete_traces(langfuse: Any, trace_ids: List[str]) -> int:
+    for i in range(0, len(trace_ids), 100):
+        langfuse.api.trace.delete_multiple(trace_ids=trace_ids[i:i + 100])
+    return len(trace_ids)
+
+
+def get_transcript_session_ids(transcript_path: Path) -> set:
+    ids = set()
+    for row in read_subagent_jsonl(transcript_path) or []:
+        session_id = row.get("sessionId")
+        if isinstance(session_id, str) and session_id:
+            ids.add(session_id)
+    return ids
+
+
+BACKFILL_MIN_IDLE_MINUTES = 30.0
+
+
+def check_backfill_target(transcript_path: Path, session_id: str, *, force: bool) -> Optional[str]:
+    """Why the backfill must not run on this transcript, or None."""
+    if transcript_path.stem != session_id:
+        return (f"session id {session_id!r} is not this transcript's ({transcript_path.stem!r}); "
+                "a wrong id would replace another session's traces")
+    if session_id not in get_transcript_session_ids(transcript_path):
+        return f"no row of {transcript_path.name} belongs to session {session_id!r}"
+    if not force:
+        try:
+            newest = transcript_path.stat().st_mtime
+            session_dir = transcript_path.with_suffix("")
+            if session_dir.is_dir():
+                # Agents and workflows keep writing under the session
+                # directory after the main transcript goes quiet.
+                for child in session_dir.rglob("*"):
+                    try:
+                        newest = max(newest, child.stat().st_mtime)
+                    except OSError:
+                        continue
+            idle_minutes = (time.time() - newest) / 60
+        except OSError as e:
+            return f"cannot stat {transcript_path}: {e}"
+        if idle_minutes < BACKFILL_MIN_IDLE_MINUTES:
+            return (f"{transcript_path.name} changed {idle_minutes:.0f} min ago; the session may still be "
+                    f"live, or one of its agents (a live hook would add turns beside the backfill). Wait "
+                    f"{BACKFILL_MIN_IDLE_MINUTES:.0f} min after it ends, or pass --force")
+    return None
+
+
+def backfill_session(
+    langfuse: Any,
+    config: LangfuseConfig,
+    session_id: str,
+    transcript_path: Path,
+) -> int:
+    """Emit a whole past session from its transcript in one pass, as at
+    SessionEnd: fresh state, every turn closed, every agent read in full.
+    Trace ids come from the backfill namespace and observation ids are
+    deterministic, so a second run would hit the same ids. Langfuse v4 does
+    not merge those at read time, so run_backfill refuses a namespace that
+    already has traces for the session instead of uploading twice."""
+    session_state = SessionState()
+    registry = AgentRegistry(None)
+    return emit_session_firing(
+        langfuse, config, session_id, transcript_path, session_state, registry,
+        flush_deferred_agent_turns=True,
+    )
+
+
+def run_backfill(argv: List[str]) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="langfuse_hook.py --backfill",
+        description="Re-upload one finished session from its transcript.",
+    )
+    parser.add_argument("--backfill", required=True, metavar="TRANSCRIPT",
+                        help="the session's main transcript, <session-id>.jsonl")
+    parser.add_argument("--session-id", default=None,
+                        help="must equal the transcript's own session id (default: its file name)")
+    parser.add_argument("--namespace", default=DEFAULT_BACKFILL_NAMESPACE,
+                        help="trace-id namespace of the re-uploaded traces; a namespace is used once per session")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="build every observation and send nothing; with --replace-session-traces "
+                             "and Langfuse keys, also list (read-only) the traces that would be deleted")
+    parser.add_argument("--per-agent-out", default=None, metavar="FILE",
+                        help="dry run: write generations and usage per agent transcript as JSON")
+    parser.add_argument("--replace-session-traces", action="store_true",
+                        help="after the upload, delete this hook's earlier turn traces of the session")
+    parser.add_argument("--verify-only", action="store_true",
+                        help="upload nothing: read back an earlier upload of this namespace (ids are "
+                             "deterministic) and, with --replace-session-traces, delete the old traces once it verifies")
+    parser.add_argument("--verify-minutes", type=float, default=None,
+                        help="how long the read-back keeps retrying (default 10)")
+    parser.add_argument("--force", action="store_true",
+                        help=f"run on a transcript modified less than {BACKFILL_MIN_IDLE_MINUTES:.0f} min ago")
+    args = parser.parse_args(argv)
+
+    global TRACE_SEED_NAMESPACE, BACKFILL_VERIFY_ATTEMPTS
+    TRACE_SEED_NAMESPACE = args.namespace or DEFAULT_BACKFILL_NAMESPACE
+    if args.verify_minutes is not None:
+        BACKFILL_VERIFY_ATTEMPTS = max(1, int(args.verify_minutes * 60 / max(BACKFILL_VERIFY_INTERVAL_S, 1e-9)) + 1)
+    transcript_path = Path(args.backfill).expanduser()
+    if not transcript_path.is_file():
+        print(f"no such transcript: {transcript_path}", file=sys.stderr)
+        return 2
+    session_id = args.session_id or transcript_path.stem
+    refusal = check_backfill_target(transcript_path, session_id, force=args.force)
+    if refusal is not None:
+        print(f"refused: {refusal}", file=sys.stderr)
+        return 3
+
+    config = get_langfuse_config()
+    if config is not None and (config.trace_seed or config.parent_context):
+        print("backfill ignores CC_LANGFUSE_TRACE_SEED / parent trace context", file=sys.stderr)
+        config.trace_seed = None
+        config.parent_trace_id = config.parent_span_id = None
+    langfuse = create_langfuse_client(config) if config is not None else None
+
+    keep_seed_client = langfuse if langfuse is not None else RecordingLangfuse()
+    keep = get_backfill_trace_ids(keep_seed_client, session_id, transcript_path)
+    existing: Optional[List[Tuple[str, Optional[str]]]] = None
+    # A dry run reads Langfuse only when asked for the delete plan.
+    if langfuse is not None and (not args.dry_run or args.replace_session_traces):
+        existing = list_session_traces(langfuse, session_id)
+        already = [item[0] for item in existing if item[0] in keep]
+        if already and not args.verify_only:
+            print(f"refused: namespace {TRACE_SEED_NAMESPACE!r} already holds {len(already)} trace(s) of "
+                  f"session {session_id}; uploading again would count them twice. Use a new --namespace "
+                  "with --replace-session-traces to supersede them.", file=sys.stderr)
+            if not args.dry_run:
+                return 3
+
+    if args.dry_run:
+        dry_config = config or LangfuseConfig(public_key="", secret_key="", host="", user_id=None)
+        recorder = RecordingLangfuse()
+        turns = backfill_session(recorder, dry_config, session_id, transcript_path)
+        summary = recorder.summary()
+        summary.update({"session_id": session_id, "namespace": TRACE_SEED_NAMESPACE, "turns": turns,
+                        "agent_spans": sum(1 for o in recorder.by_id.values()
+                                           if o.as_type == "span" and o.name.startswith(("Subagent", "Workflow agent")))})
+        if args.replace_session_traces:
+            if existing is None:
+                summary["replace_plan"] = "not listed: no Langfuse keys in the environment"
+            else:
+                plan = plan_trace_replacement(existing, keep)
+                summary["replace_plan"] = {k: len(v) for k, v in plan.items()}
+                summary["would_delete"] = plan["delete"]
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        if args.per_agent_out:
+            Path(args.per_agent_out).write_text(
+                json.dumps(recorder.per_agent(), indent=1, sort_keys=True), encoding="utf-8"
+            )
+        if langfuse is not None:
+            langfuse.shutdown()
+        return 0
+
+    if langfuse is None:
+        log_missing_langfuse_config()
+        print("Langfuse keys missing (LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)", file=sys.stderr)
+        return 2
+    try:
+        if args.verify_only:
+            # Ids are deterministic: rebuild what the upload sent, send nothing.
+            recorder = RecordingLangfuse()
+            turns = backfill_session(recorder, config, session_id, transcript_path)
+            expected: Dict[str, set] = {}
+            for observation in recorder.by_id.values():
+                expected.setdefault(observation.trace_id, set()).add(observation.id)
+        else:
+            # Upload first: if it fails part-way, the old traces are still there.
+            expected = record_uploaded_observation_ids(langfuse)
+            turns = backfill_session(langfuse, config, session_id, transcript_path)
+            langfuse.flush()
+            print(f"uploaded {turns} turn(s) of session {session_id} (namespace {TRACE_SEED_NAMESPACE})")
+        print(f"verifying {sum(len(v) for v in expected.values())} observation(s) in {len(expected)} trace(s)")
+        if not expected:
+            # Nothing to compare against would verify vacuously.
+            print("refused: the backfill produced no observations to verify; nothing was deleted.",
+                  file=sys.stderr)
+            return 4
+        missing = verify_upload(langfuse, session_id, expected)
+        if missing:
+            print(f"refused: {sum(missing.values())} uploaded observation(s) in {len(missing)} trace(s) "
+                  f"are not readable back from Langfuse. Nothing was deleted.\n"
+                  f"  Still ingesting? Re-check without uploading: --verify-only with the same "
+                  f"--namespace {TRACE_SEED_NAMESPACE} (add --replace-session-traces to delete the old "
+                  f"traces once it verifies; --verify-minutes to wait longer).\n"
+                  f"  Upload failed? Start over with a new --namespace and --replace-session-traces; "
+                  f"that also removes this partial upload.", file=sys.stderr)
+            return 4
+        print("verified: every uploaded observation is readable back")
+        if args.replace_session_traces:
+            plan = plan_trace_replacement(list_session_traces(langfuse, session_id), keep)
+            deleted = delete_traces(langfuse, plan["delete"])
+            print(f"deleted {deleted} earlier trace(s) of session {session_id}; kept "
+                  f"{len(plan['foreign'])} trace(s) this hook did not name {TRACE_NAME!r}")
+    finally:
+        try:
+            langfuse.flush()
+        finally:
+            langfuse.shutdown()
+    return 0
 
 
 # ----------------- Main -----------------
@@ -3645,4 +4879,6 @@ def main() -> int:
         flush_and_shutdown_langfuse_client(langfuse)
 
 if __name__ == "__main__":
+    if "--backfill" in sys.argv[1:]:
+        sys.exit(run_backfill(sys.argv[1:]))
     sys.exit(main())

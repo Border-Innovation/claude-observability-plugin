@@ -1,0 +1,1 @@
+{"agentType": "codegen-agent", "description": "Codegen child2", "toolUseId": "toolu_child2", "spawnDepth": 2, "parentAgentId": "orch", "requestShape": "background"}

@@ -95,6 +95,10 @@ def _install_langfuse_stubs() -> None:
             self.is_remote = is_remote
             self.trace_flags = trace_flags
 
+        @property
+        def is_valid(self) -> bool:
+            return bool(self.trace_id) and bool(self.span_id)
+
     class NonRecordingSpan:
         def __init__(self, span_context: SpanContext) -> None:
             self._span_context = span_context
@@ -102,14 +106,25 @@ def _install_langfuse_stubs() -> None:
         def get_span_context(self) -> SpanContext:
             return self._span_context
 
+        def set_attribute(self, key: str, value: Any) -> None:
+            pass
+
     def set_span_in_context(span: Any, context: Any = None) -> dict[str, Any]:
         return {"current_span": span}
+
+    def get_current_span(context: Any = None) -> Any:
+        if isinstance(context, dict) and context.get("current_span") is not None:
+            return context["current_span"]
+        if _ACTIVE_SPAN_STACK and _ACTIVE_SPAN_STACK[-1] is not None:
+            return _ACTIVE_SPAN_STACK[-1]
+        return NonRecordingSpan(SpanContext(0, 0, False))
 
     trace_module.use_span = use_span
     trace_module.TraceFlags = TraceFlags
     trace_module.SpanContext = SpanContext
     trace_module.NonRecordingSpan = NonRecordingSpan
     trace_module.set_span_in_context = set_span_in_context
+    trace_module.get_current_span = get_current_span
     opentelemetry_module.trace = trace_module
     sys.modules["opentelemetry"] = opentelemetry_module
     sys.modules["opentelemetry.trace"] = trace_module
@@ -145,8 +160,33 @@ def read_fixture_jsonl() -> Any:
     return read_jsonl
 
 
+class FakeIdGenerator:
+    """Counter-based stand-in for OTel's RandomIdGenerator."""
+
+    def __init__(self) -> None:
+        self._span_ids = itertools.count(1)
+        self._trace_ids = itertools.count(1)
+
+    def generate_span_id(self) -> int:
+        return next(self._span_ids)
+
+    def generate_trace_id(self) -> int:
+        return (1 << 100) + next(self._trace_ids)
+
+    def is_trace_id_random(self) -> bool:
+        return True
+
+
+class _FakeSpanContext:
+    def __init__(self, trace_id: int, span_id: int) -> None:
+        self.trace_id = trace_id
+        self.span_id = span_id
+        self.is_remote = False
+
+
 class FakeOtelSpan:
-    def __init__(self, name: str, start_time: int | None, context: Any = None) -> None:
+    def __init__(self, name: str, start_time: int | None, context: Any = None,
+                 trace_id: int = 0, span_id: int = 0) -> None:
         self.name = name
         self.start_time = start_time
         self.context = context
@@ -154,17 +194,44 @@ class FakeOtelSpan:
         # The span this one was started under (via the stubbed use_span);
         # None for roots and carrier-context spans.
         self.parent = _ACTIVE_SPAN_STACK[-1] if _ACTIVE_SPAN_STACK else None
+        self._span_context = _FakeSpanContext(trace_id, span_id)
+
+    def get_span_context(self) -> Any:
+        return self._span_context
 
     def set_attribute(self, key: str, value: Any) -> None:
         self.attributes[key] = value
 
 
+def nests_under(observation: Any, parent_observation: Any) -> bool:
+    """Nesting as Langfuse sees it: the parent's span id, whether the child
+    was started under the parent object or under a carrier with its ids."""
+    parent = observation._otel_span.parent
+    if parent is None or not hasattr(parent, "get_span_context"):
+        return False
+    a = parent.get_span_context()
+    b = parent_observation._otel_span.get_span_context()
+    return (a.trace_id, a.span_id) == (b.trace_id, b.span_id)
+
+
 class FakeTracer:
+    """Mirrors the SDK tracer: the span id comes from self.id_generator, the
+    trace id from the parent span (active span or context carrier)."""
+
+    def __init__(self) -> None:
+        self.id_generator: Any = FakeIdGenerator()
+
     def start_span(self, *, name: str, start_time: int | None = None, context: Any = None) -> FakeOtelSpan:
-        return FakeOtelSpan(name, start_time, context)
-
-
-_fake_observation_counter = itertools.count(1)
+        parent = _ACTIVE_SPAN_STACK[-1] if _ACTIVE_SPAN_STACK else None
+        if context is not None and isinstance(context, dict):
+            parent = context.get("current_span", parent)
+        trace_id = 0
+        if parent is not None and hasattr(parent, "get_span_context"):
+            trace_id = parent.get_span_context().trace_id
+        if not trace_id:
+            trace_id = self.id_generator.generate_trace_id()
+        span_id = self.id_generator.generate_span_id()
+        return FakeOtelSpan(name, start_time, context, trace_id=trace_id, span_id=span_id)
 
 
 class FakeObservation:
@@ -175,10 +242,11 @@ class FakeObservation:
         self.kwargs = kwargs
         self.output: Any = None
         self.end_time: int | None = None
-        # Mirror the SDK's hex id/trace_id attributes (span.py sets both).
-        n = next(_fake_observation_counter)
-        self.id = f"{n:016x}"
-        self.trace_id = f"{n:032x}"
+        # Mirror the SDK's hex id/trace_id attributes (span.py sets both,
+        # from the OTel span context).
+        context = otel_span.get_span_context()
+        self.id = f"{context.span_id:016x}"
+        self.trace_id = f"{context.trace_id:032x}"
 
     def update(self, **kwargs: Any) -> None:
         if "output" in kwargs:

@@ -5,6 +5,8 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from conftest import nests_under
+
 
 def copy_workflow_fixture(fixture_transcript_path: Any, tmp_path: Path) -> tuple[Path, list[dict[str, Any]]]:
     """Copy the workflow fixture's transcript directory (agent transcripts,
@@ -123,7 +125,7 @@ def test_workflow_turn_defers_and_emits_agents_nested_under_the_tool_span(
     # carry the journal's per-agent result in their metadata.
     agent_spans = [o for o in fake_langfuse.observations if o.name.startswith("Workflow agent: ")]
     assert len(agent_spans) == 2
-    assert all(o._otel_span.parent is tool_span._otel_span for o in agent_spans)
+    assert all(nests_under(o, tool_span) for o in agent_spans)
     r1_span = next(o for o in agent_spans if o.name.endswith("/r1"))
     assert r1_span.kwargs["metadata"]["workflow_agent_id"] == "r1"
     assert json.loads(r1_span.kwargs["metadata"]["workflow_agent_result"]) == {
@@ -140,10 +142,9 @@ def test_workflow_turn_defers_and_emits_agents_nested_under_the_tool_span(
 
     # Generations nest under their agent spans and share the plain "LLM Call"
     # name (context lives on the parent); token math: TOTAL_AGENT_OUTPUT_TOKENS.
-    agent_otel_spans = {o._otel_span for o in agent_spans}
     agent_generations = [
         o for o in fake_langfuse.observations
-        if o.as_type == "generation" and o._otel_span.parent in agent_otel_spans
+        if o.as_type == "generation" and any(nests_under(o, a) for a in agent_spans)
     ]
     assert len(agent_generations) == 4
     assert all(o.name == "LLM Call" for o in agent_generations)
@@ -193,7 +194,7 @@ def test_session_end_flush_emits_never_completed_workflow_turn_with_agents(
     assert "Workflow agent: verify-claims/r2" in names
     tool_span = next(o for o in fake_langfuse.observations if o.name == "Tool: Workflow")
     agent_spans = [o for o in fake_langfuse.observations if o.name.startswith("Workflow agent: ")]
-    assert all(o._otel_span.parent is tool_span._otel_span for o in agent_spans)
+    assert all(nests_under(o, tool_span) for o in agent_spans)
 
     # The agents' end timestamps must propagate through workflow_end_timestamp
     # to both the tool span and the root: every parent-turn row predates the
@@ -232,7 +233,7 @@ def test_structured_output_ending_agent_falls_back_to_journal_result_output(
         o for o in fake_langfuse.observations if o.name == "Tool: StructuredOutput"
     ]
     assert len(structured_output_spans) == 2
-    assert all(o._otel_span.parent is r2_span._otel_span for o in structured_output_spans)
+    assert all(nests_under(o, r2_span) for o in structured_output_spans)
 
     # D1: r2's final message is tool_use-only, so its text extracts empty; the
     # span output falls back to the agent's journal result as a JSON string.
@@ -248,10 +249,9 @@ def test_structured_output_ending_agent_falls_back_to_journal_result_output(
 
     # Generation split/merge arithmetic stays documented: r1 = 2 whole
     # messages, r2 = 2 merged messages (split rows share message.id).
-    agent_otel_spans = {o._otel_span for o in agent_spans}
     agent_generations = [
         o for o in fake_langfuse.observations
-        if o.as_type == "generation" and o._otel_span.parent in agent_otel_spans
+        if o.as_type == "generation" and any(nests_under(o, a) for a in agent_spans)
     ]
     assert len(agent_generations) == 4
     assert sum(g.kwargs["usage_details"]["output"] for g in agent_generations) == TOTAL_AGENT_OUTPUT_TOKENS
@@ -467,7 +467,7 @@ def test_workflow_launch_without_workflow_name_falls_back_to_run_id_labels(
     assert tool_span.kwargs["metadata"]["workflow_run_id"] == "wf_test001"
     assert "workflow_name" not in tool_span.kwargs["metadata"]
     agent_spans = [o for o in fake_langfuse.observations if o.name.startswith("Workflow agent: ")]
-    assert all(o._otel_span.parent is tool_span._otel_span for o in agent_spans)
+    assert all(nests_under(o, tool_span) for o in agent_spans)
     assert all("workflow_name" not in o.kwargs["metadata"] for o in agent_spans)
 
 
