@@ -1153,13 +1153,15 @@ def resolve_deferred_agent_turns(
 
     session_state.pending_task_notifications = stashed_notifications[-MAX_PENDING_TASK_NOTIFICATIONS:]
 
-    # Pop fully resolved turns in deferral (i.e. chronological) order.
+    # Pop fully resolved turns in deferral (i.e. chronological) order; a
+    # turn past the defer bound is popped too and ships as it is.
+    newest = get_latest_row_timestamp(rows)
     resolved_turn_row_lists: List[List[Dict[str, Any]]] = []
     still_pending: List[Dict[str, Any]] = []
     for pending_turn in session_state.pending_agent_turns:
         if not isinstance(pending_turn, dict) or not isinstance(pending_turn.get("rows"), list):
             continue
-        if pending_turn.get("pending_tool_use_ids"):
+        if pending_turn.get("pending_tool_use_ids") and not is_older_than_defer_bound(pending_turn["rows"], newest):
             still_pending.append(pending_turn)
             continue
         resolved_turn_row_lists.append(pending_turn["rows"])
@@ -1311,17 +1313,112 @@ def turn_has_unresolved_async_activity(turn: Turn) -> bool:
     )
 
 
+def get_stopped_task_id(row: Dict[str, Any]) -> Optional[str]:
+    """Task id a successful TaskStop result row stopped, or None. A stopped
+    task never notifies, so its launch would otherwise wait forever. A
+    failed stop comes back as an error string, not a dict."""
+    if not is_tool_result(row):
+        return None
+    tool_use_result = row.get("toolUseResult")
+    if not isinstance(tool_use_result, dict):
+        return None
+    task_id = tool_use_result.get("task_id")
+    if not isinstance(task_id, str) or not task_id:
+        return None
+    if any(block.get("is_error") is True for block in get_tool_result_blocks(get_content_from_row(row))):
+        return None
+    return task_id
+
+
+def get_launch_tool_use_ids_by_task_id(rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """task id -> launching tool_use id, from async launch results
+    (toolUseResult.taskId for workflows and shells, agentId for agents)."""
+    out: Dict[str, str] = {}
+    for row in rows:
+        tool_use_result = row.get("toolUseResult") if isinstance(row, dict) else None
+        if not isinstance(tool_use_result, dict):
+            continue
+        task_id = tool_use_result.get("taskId") or tool_use_result.get("agentId")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        for block in get_tool_result_blocks(get_content_from_row(row)):
+            tool_use_id = block.get("tool_use_id")
+            if tool_use_id:
+                out[task_id] = str(tool_use_id)
+    return out
+
+
+def expand_task_stop_rows(
+    rows: List[Dict[str, Any]],
+    lookup_rows: List[Dict[str, Any]],
+    task_id_to_tool_use_id: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """After each successful TaskStop result, add a synthetic notification
+    resolving the stopped launch, so its turn stops waiting. Idempotent:
+    a TaskStop row already followed by its synthetic row is not expanded
+    again (held rows pass through here on every firing)."""
+    launches: Optional[Dict[str, str]] = None
+    done = {row.get("syntheticForUuid") for row in rows if isinstance(row, dict) and row.get("syntheticForUuid")}
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(row)
+        if not isinstance(row, dict) or row.get("syntheticForUuid"):
+            continue
+        task_id = get_stopped_task_id(row)
+        if task_id is None:
+            continue
+        marker = str(row.get("uuid") or f"taskstop:{task_id}")
+        if marker in done:
+            continue
+        if launches is None:
+            launches = get_launch_tool_use_ids_by_task_id(lookup_rows)
+        tool_use_id = launches.get(task_id) or (task_id_to_tool_use_id or {}).get(task_id)
+        if not tool_use_id:
+            continue
+        done.add(marker)
+        out.append({
+            "type": "user",
+            "timestamp": row.get("timestamp"),
+            "sessionId": row.get("sessionId"),
+            "syntheticForUuid": marker,
+            "origin": {"kind": "task-notification"},
+            "message": {"role": "user", "content": (
+                f"<task-notification>\n<task-id>{task_id}</task-id>\n<tool-use-id>{tool_use_id}</tool-use-id>\n"
+                "<status>stopped</status>\n<result>Stopped with TaskStop.</result>\n</task-notification>"
+            )},
+        })
+    return out
+
+
+try:
+    MAX_DEFER_SECONDS = float(_opt("CC_LANGFUSE_MAX_DEFER_HOURS") or "12") * 3600
+except ValueError:
+    MAX_DEFER_SECONDS = 12 * 3600
+
+
+def get_latest_row_timestamp(rows: List[Dict[str, Any]]) -> Optional[datetime]:
+    return _get_latest_timestamp(*[parse_timestamp(row) for row in rows if isinstance(row, dict)])
+
+
+def is_older_than_defer_bound(rows: List[Dict[str, Any]], newest: Optional[datetime]) -> bool:
+    """A turn whose launch never notifies (killed, stopped from outside)
+    would wait for SessionEnd; past this age it ships as it is."""
+    latest = get_latest_row_timestamp(rows)
+    return newest is not None and latest is not None and (newest - latest).total_seconds() > MAX_DEFER_SECONDS
+
+
 def get_turns_to_emit(
     turns: List[Turn],
     session_state: SessionState,
     *,
     flush_deferred_agent_turns: bool = False,
+    newest_timestamp: Optional[datetime] = None,
 ) -> List[Turn]:
     turns_to_emit: List[Turn] = []
     for turn in turns:
         pending_agent_tool_use_ids = get_pending_agent_tool_use_ids(turn)
         if pending_agent_tool_use_ids:
-            if flush_deferred_agent_turns:
+            if flush_deferred_agent_turns or is_older_than_defer_bound(turn.rows, newest_timestamp):
                 debug(f"Emitting async agent turn without task notification: {pending_agent_tool_use_ids}")
                 turns_to_emit.append(turn)
                 continue
@@ -1530,14 +1627,18 @@ def assemble_turns(
     turns: List[Turn] = []
     state = TurnAssemblyState()
 
+    rows = expand_task_stop_rows(rows, rows, task_id_to_tool_use_id)
     for row in rows:
+        # Before the isMeta check: a subagent receives a notification as an
+        # isMeta user row ("[SYSTEM NOTIFICATION ...]" with origin kind
+        # task-notification), which the injected-context branch would eat.
+        if add_task_notification_row(row, state, task_id_to_tool_use_id, closed_turns=turns):
+            continue
+
         if add_injected_context_row(row, state):
             continue
 
         if add_tool_result_row(row, state):
-            continue
-
-        if add_task_notification_row(row, state, task_id_to_tool_use_id, closed_turns=turns):
             continue
 
         if add_interrupted_turn_row(row, state):
@@ -1689,6 +1790,12 @@ def get_new_turns_from_transcript(
         rows = held_rows + rows
         session_state.open_turn = {}
 
+    pending_rows = [
+        row for pending_turn in session_state.pending_agent_turns
+        if isinstance(pending_turn, dict) and isinstance(pending_turn.get("rows"), list)
+        for row in pending_turn["rows"]
+    ]
+    rows = expand_task_stop_rows(rows, pending_rows + rows, task_id_to_tool_use_id)
     deferred_turn_row_lists, rows = resolve_deferred_agent_turns(rows, session_state, task_id_to_tool_use_id)
 
     if flush_deferred_agent_turns and session_state.pending_agent_turns:
@@ -2573,10 +2680,15 @@ class EmissionCursor:
     emitted: set
     completed_only: bool = False
     newly_emitted: List[str] = field(default_factory=list)
+    # Keys that are not complete whatever the caller computes (an agent's
+    # last message while it is still being written).
+    held: set = field(default_factory=set)
 
     def should_emit(self, key: str, complete: bool = True) -> bool:
         if key in self.emitted:
             return False
+        if key in self.held:
+            complete = False
         if self.completed_only and not complete:
             return False
         self.emitted.add(key)
@@ -3275,6 +3387,31 @@ def force_finalize(enabled: bool) -> Any:
         _FORCE_FINALIZE.reset(token)
 
 
+# An agent transcript unchanged this long is treated as at rest even when its
+# last message never got a stop_reason (an agent killed mid-message).
+AGENT_IDLE_SETTLE_SECONDS = 30 * 60
+
+
+def get_streaming_message_key(turns: List[Turn]) -> Optional[str]:
+    """Emission key of the agent's last message if it may still be written.
+
+    A message is written as several rows sharing message.id; the earlier
+    rows carry partial usage and stop_reason null. Only the main
+    transcript is guaranteed complete at a Stop, so in an agent transcript
+    the LAST message is final only once its last row has a stop_reason. An
+    earlier message with a null stop_reason is final: a later message
+    exists."""
+    if not turns or not turns[-1].assistant_msgs:
+        return None
+    last_turn = turns[-1]
+    index = len(last_turn.assistant_msgs) - 1
+    last_message = last_turn.assistant_msgs[index]
+    message = last_message.get("message")
+    if isinstance(message, dict) and "stop_reason" in message and message.get("stop_reason") is None:
+        return generation_emission_key(index, last_message)
+    return None
+
+
 def agent_is_settled(turns: List[Turn]) -> bool:
     """True when the agent transcript, as it is now, ends at rest: no async
     launch without its notification, no queued notification undelivered, no
@@ -3294,6 +3431,18 @@ def agent_is_settled(turns: List[Turn]) -> bool:
                 return False
     last_message = last_turn.assistant_msgs[-1].get("message")
     if isinstance(last_message, dict) and last_message.get("stop_reason") == "tool_use":
+        return False
+    if get_streaming_message_key(turns) is not None:
+        return False
+    return True
+
+
+def agent_is_settled_but_for_streaming(turns: List[Turn]) -> bool:
+    """agent_is_settled, ignoring only a last message that never got its
+    stop_reason (used once the transcript has been idle for a long time)."""
+    if not turns:
+        return False
+    if any(turn_has_unresolved_async_activity(turn) for turn in turns):
         return False
     return True
 
@@ -3409,10 +3558,27 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
         trace_id_hex, parent_span_id_hex = parent_ids
         agent_span_id_hex = f"{derive_span_id(trace_id_hex, f'agent:{agent_id}'):016x}"
         children_parent = carrier_span(trace_id_hex, agent_span_id_hex)
-        settled = force or known_finished or agent_is_settled(turns)
+        idle_seconds = 0.0
+        try:
+            idle_seconds = time.time() - path.stat().st_mtime
+        except OSError:
+            pass
+        streaming_key = get_streaming_message_key(turns)
+        settled = (
+            force
+            or known_finished
+            or agent_is_settled(turns)
+            # Killed mid-message: the last message never gets its stop_reason.
+            or (idle_seconds > AGENT_IDLE_SETTLE_SECONDS and streaming_key is not None
+                and agent_is_settled_but_for_streaming(turns))
+            # Killed while waiting on a launch that will never notify; the
+            # same bound as a waiting main turn.
+            or idle_seconds > MAX_DEFER_SECONDS
+        )
         cursor = EmissionCursor(
             emitted=set(k for k in (entry or {}).get("emitted", []) if isinstance(k, str)),
             completed_only=not settled,
+            held={streaming_key} if streaming_key is not None and not settled else set(),
         )
     else:
         settled = True
@@ -4050,6 +4216,7 @@ def emit_session_firing(
                 turns,
                 session_state,
                 flush_deferred_agent_turns=flush_deferred_agent_turns,
+                newest_timestamp=get_latest_row_timestamp([r for t in turns for r in t.rows]),
             )
             emitted = emit_and_close_ready_turns(
                 langfuse,
@@ -4321,16 +4488,22 @@ def get_backfill_trace_ids(langfuse: Any, session_id: str, transcript_path: Path
     return trace_ids
 
 
-def list_session_traces(langfuse: Any, session_id: str) -> List[Tuple[str, Optional[str]]]:
-    """(id, name) of every trace Langfuse holds for the session (read-only)."""
-    traces_out: List[Tuple[str, Optional[str]]] = []
+def list_session_traces(langfuse: Any, session_id: str, *, with_observations: bool = False) -> List[Tuple[Any, ...]]:
+    """(id, name[, observation ids]) of every trace Langfuse holds for the
+    session (read-only)."""
+    traces_out: List[Tuple[Any, ...]] = []
     page = 1
+    fields = "core,observations" if with_observations else "core"
     while True:
-        traces = langfuse.api.trace.list(session_id=session_id, page=page, limit=100, fields="core")
+        traces = langfuse.api.trace.list(session_id=session_id, page=page, limit=100, fields=fields)
         data = list(getattr(traces, "data", None) or [])
         for trace in data:
             trace_id = getattr(trace, "id", None)
-            if trace_id:
+            if not trace_id:
+                continue
+            if with_observations:
+                traces_out.append((trace_id, getattr(trace, "name", None), set(getattr(trace, "observations", None) or [])))
+            else:
                 traces_out.append((trace_id, getattr(trace, "name", None)))
         total_pages = getattr(getattr(traces, "meta", None), "total_pages", None) or page
         if not data or page >= total_pages:
@@ -4346,7 +4519,8 @@ def plan_trace_replacement(
     delete), the backfill's own (kept), and anything another emitter put
     under the same session id (never touched)."""
     plan: Dict[str, List[str]] = {"delete": [], "keep": [], "foreign": []}
-    for trace_id, name in traces:
+    for item in traces:
+        trace_id, name = item[0], item[1]
         if trace_id in keep:
             plan["keep"].append(trace_id)
         elif name == TRACE_NAME:
@@ -4354,6 +4528,48 @@ def plan_trace_replacement(
         else:
             plan["foreign"].append(trace_id)
     return plan
+
+
+BACKFILL_VERIFY_ATTEMPTS = 40
+BACKFILL_VERIFY_INTERVAL_S = 15.0
+
+
+def record_uploaded_observation_ids(langfuse: Any) -> Dict[str, set]:
+    """Wrap the client so every observation the backfill creates is noted
+    per trace: the read-back compares the server against exactly this."""
+    expected: Dict[str, set] = {}
+    create = langfuse._create_observation_from_otel_span
+
+    def recording_create(*args: Any, **kwargs: Any) -> Any:
+        observation = create(*args, **kwargs)
+        trace_id, observation_id = getattr(observation, "trace_id", None), getattr(observation, "id", None)
+        if trace_id and observation_id:
+            expected.setdefault(trace_id, set()).add(observation_id)
+        return observation
+
+    langfuse._create_observation_from_otel_span = recording_create
+    return expected
+
+
+def verify_upload(langfuse: Any, session_id: str, expected: Dict[str, set]) -> Dict[str, int]:
+    """Read back until every uploaded observation is visible, or give up.
+
+    flush() does not raise on a rejected batch (the exporter only logs it),
+    so this is the only proof the upload landed. Returns missing observation
+    counts per trace; empty means verified."""
+    missing: Dict[str, int] = {t: len(ids) for t, ids in expected.items()}
+    for attempt in range(max(1, BACKFILL_VERIFY_ATTEMPTS)):
+        present = {item[0]: item[2] for item in list_session_traces(langfuse, session_id, with_observations=True)}
+        missing = {
+            trace_id: len(ids - present.get(trace_id, set()))
+            for trace_id, ids in expected.items()
+            if ids - present.get(trace_id, set())
+        }
+        if not missing:
+            return {}
+        if attempt + 1 < BACKFILL_VERIFY_ATTEMPTS:
+            time.sleep(BACKFILL_VERIFY_INTERVAL_S)
+    return missing
 
 
 def delete_traces(langfuse: Any, trace_ids: List[str]) -> int:
@@ -4383,12 +4599,22 @@ def check_backfill_target(transcript_path: Path, session_id: str, *, force: bool
         return f"no row of {transcript_path.name} belongs to session {session_id!r}"
     if not force:
         try:
-            idle_minutes = (time.time() - transcript_path.stat().st_mtime) / 60
+            newest = transcript_path.stat().st_mtime
+            session_dir = transcript_path.with_suffix("")
+            if session_dir.is_dir():
+                # Agents and workflows keep writing under the session
+                # directory after the main transcript goes quiet.
+                for child in session_dir.rglob("*"):
+                    try:
+                        newest = max(newest, child.stat().st_mtime)
+                    except OSError:
+                        continue
+            idle_minutes = (time.time() - newest) / 60
         except OSError as e:
             return f"cannot stat {transcript_path}: {e}"
         if idle_minutes < BACKFILL_MIN_IDLE_MINUTES:
             return (f"{transcript_path.name} changed {idle_minutes:.0f} min ago; the session may still be "
-                    f"live (a live hook would add turns beside the backfill). Wait "
+                    f"live, or one of its agents (a live hook would add turns beside the backfill). Wait "
                     f"{BACKFILL_MIN_IDLE_MINUTES:.0f} min after it ends, or pass --force")
     return None
 
@@ -4499,9 +4725,18 @@ def run_backfill(argv: List[str]) -> int:
         return 2
     try:
         # Upload first: if it fails part-way, the old traces are still there.
+        expected = record_uploaded_observation_ids(langfuse)
         turns = backfill_session(langfuse, config, session_id, transcript_path)
         langfuse.flush()
-        print(f"backfilled {turns} turn(s) of session {session_id} (namespace {TRACE_SEED_NAMESPACE})")
+        print(f"uploaded {turns} turn(s) of session {session_id} (namespace {TRACE_SEED_NAMESPACE}); "
+              f"verifying {sum(len(v) for v in expected.values())} observation(s) in {len(expected)} trace(s)")
+        missing = verify_upload(langfuse, session_id, expected)
+        if missing:
+            print(f"refused: {sum(missing.values())} uploaded observation(s) in {len(missing)} trace(s) "
+                  f"are not readable back from Langfuse; the upload failed or is still being ingested. "
+                  f"Nothing was deleted.", file=sys.stderr)
+            return 4
+        print("verified: every uploaded observation is readable back")
         if args.replace_session_traces:
             plan = plan_trace_replacement(list_session_traces(langfuse, session_id), keep)
             deleted = delete_traces(langfuse, plan["delete"])

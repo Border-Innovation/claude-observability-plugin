@@ -90,11 +90,15 @@ the hook are read from the environment.
   `backfill-v1`). Langfuse v4 does not merge two uploads of one observation
   id, so a namespace that already holds traces of the session is refused;
   supersede an earlier backfill with a new namespace.
-- `--replace-session-traces` deletes, after the upload has been flushed, the
-  session's traces this hook named `Claude Code Turn` that are not the
-  backfill's own. Traces under another name are never touched. With
-  `--dry-run` it lists them instead.
-- The session id must be the transcript's own, and a transcript modified in
+- After the upload, the backfill reads the session back from Langfuse until
+  every observation it sent is visible (up to 10 minutes). If any is
+  missing it exits with code 4 and deletes nothing: a rejected upload is
+  only logged by the exporter, never raised.
+- `--replace-session-traces` then deletes the session's traces this hook
+  named `Claude Code Turn` that are not the backfill's own. Traces under
+  another name are never touched. With `--dry-run` it lists them instead.
+- The session id must be the transcript's own (file name and rows), and a
+  session with any file under its directory (agents, workflows) modified in
   the last 30 minutes is refused unless `--force` is passed.
 
 ## Troubleshooting
