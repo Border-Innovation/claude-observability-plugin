@@ -1,0 +1,1 @@
+{"agentType": "fix-codegen-worker", "description": "Review svcA fix diff", "toolUseId": "toolu_01BS3Np19DP2JfdVg7YSieZf", "spawnDepth": 3, "requestShape": "background", "parentAgentId": "tc-middle"}

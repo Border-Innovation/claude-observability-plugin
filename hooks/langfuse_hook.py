@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -40,6 +41,10 @@ def _opt(name: str) -> str:
 DEBUG = _opt("CC_LANGFUSE_DEBUG").lower() == "true"
 SKILL_TAGS = (_opt("CC_LANGFUSE_SKILL_TAGS") or "true").lower() == "true"
 AGENT_TYPE_TAGS = (_opt("CC_LANGFUSE_AGENT_TYPE_TAGS") or "true").lower() == "true"
+# Lift a "[tc key=value ...]" header line at the top of a prompt into the
+# metadata of the agent span it belongs to (tc_<key>), and into every agent
+# below it that carries none of its own (tc_source "inherited").
+TC_HEADERS = (_opt("CC_LANGFUSE_TC_HEADERS") or "true").lower() == "true"
 CAPTURE_SKILL_CONTENT = _opt("CC_LANGFUSE_CAPTURE_SKILL_CONTENT").lower() == "true"
 CAPTURE_IMAGES = (_opt("CC_LANGFUSE_CAPTURE_IMAGES") or "true").lower() == "true"
 # Each generation's input carries the conversation so far. On a long session that is
@@ -2384,6 +2389,8 @@ def get_trace_tags(
         tags += collect_subagent_skill_tags(turn, subagent_transcripts_by_tool_use_id)
     if AGENT_TYPE_TAGS:
         tags += collect_subagent_agent_type_tags(turn, subagent_transcripts_by_tool_use_id)
+    if TC_HEADERS:
+        tags += [tag for tag in collect_tc_tags(turn, subagent_transcripts_by_tool_use_id) if tag not in tags]
     tags += [tag for tag in OPERATOR_TAGS if tag not in tags]
     return tags
 
@@ -2416,6 +2423,167 @@ def collect_subagent_agent_type_tags(
                 if tag not in names:
                     names.append(tag)
     return names
+
+
+# ---- "[tc ...]" prompt headers ----
+# A launcher can start a prompt with one line such as
+#   [tc migration=m1 batch=b2 fqn=pkg:svc phase=codegen]
+# to say what the agent's work is for. The header is lifted from the prompt
+# itself (never from the span input, which is truncated to MAX_CHARS and, on
+# some Claude Code versions, preceded by injected context), so a long prompt
+# keeps it. Two places count, both near the top: the first non-blank line
+# (anywhere in it), or any line that BEGINS with the header within the first
+# TC_HEADER_SEARCH_CHARS characters (a workflow brief is relayed indented
+# below the harness's own line). A header mentioned mid-line further down is
+# not one. Empty values ("pr= issue=") are dropped, not rejected.
+TC_HEADER_SEARCH_CHARS = 4000
+TC_MAX_KEYS = 20
+TC_MAX_VALUE_CHARS = 200
+_TC_PAIRS = r"((?:[ \t]+[a-z][a-z0-9_]*=[^\s\]]*)+)"
+_TC_HEADER_LINE_START_RE = re.compile(r"^[ \t]*\[tc" + _TC_PAIRS + r"[ \t]*\]", re.MULTILINE)
+_TC_HEADER_IN_LINE_RE = re.compile(r"\[tc" + _TC_PAIRS + r"[ \t]*\]")
+TC_SOURCE_OWN = "own"
+TC_SOURCE_INHERITED = "inherited"
+TC_SOURCE_NONE = "none"
+
+
+def parse_tc_header(text: Any) -> Optional[Dict[str, str]]:
+    """The key=value pairs of a prompt's "[tc ...]" header, or None."""
+    if not isinstance(text, str) or "[tc" not in text:
+        return None
+    head = text[:TC_HEADER_SEARCH_CHARS]
+    first_line = next((line for line in head.splitlines() if line.strip()), "")
+    match = _TC_HEADER_IN_LINE_RE.search(first_line) or _TC_HEADER_LINE_START_RE.search(head)
+    if match is None:
+        return None
+    pairs: Dict[str, str] = {}
+    for item in match.group(1).split():
+        key, _, value = item.partition("=")
+        if not value or key in pairs or len(pairs) >= TC_MAX_KEYS:
+            continue
+        pairs[key] = value[:TC_MAX_VALUE_CHARS]
+    return pairs or None
+
+
+def get_prompt_texts(rows: List[Dict[str, Any]]) -> List[str]:
+    """The texts of the user rows before the first assistant row: an agent's
+    prompt. A workflow agent gets two (the relayed user request, then the
+    computed task); a classic agent gets one."""
+    texts: List[str] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("isMeta"):
+            continue
+        role = get_user_or_assistant_role_from_row(row)
+        if role == "assistant":
+            break
+        if role != "user" or is_tool_result(row):
+            continue
+        text = extract_text_from_content(get_content_from_row(row))
+        if text:
+            texts.append(text)
+    return texts
+
+
+def tc_header_from_rows(rows: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    """The agent's own header. The last prompt row wins: for a workflow
+    agent that is the computed task, whose header is the agent's own, while
+    the relayed request above it may carry the launching session's."""
+    for text in reversed(get_prompt_texts(rows)):
+        header = parse_tc_header(text)
+        if header:
+            return header
+    return None
+
+
+# The effective header of the agent (or main-thread turn) whose observations
+# are being emitted, inherited by every agent launched below it that carries
+# no header of its own.
+_TC_CONTEXT: "contextvars.ContextVar[Optional[Dict[str, str]]]" = contextvars.ContextVar(
+    "cc_langfuse_tc_context", default=None
+)
+
+
+@contextlib.contextmanager
+def tc_context(header: Optional[Dict[str, str]]) -> Any:
+    token = _TC_CONTEXT.set(dict(header) if header else None)
+    try:
+        yield
+    finally:
+        _TC_CONTEXT.reset(token)
+
+
+def resolve_tc(own: Optional[Dict[str, str]],
+               inherited: Optional[Dict[str, str]]) -> Tuple[Optional[Dict[str, str]], str]:
+    """(effective header, source): an own header replaces the inherited one
+    whole, never merged key by key, so a child cannot end up claiming a
+    combination nobody wrote."""
+    if own:
+        return dict(own), TC_SOURCE_OWN
+    if inherited:
+        return dict(inherited), TC_SOURCE_INHERITED
+    return None, TC_SOURCE_NONE
+
+
+def tc_metadata(effective: Optional[Dict[str, str]], source: str) -> Dict[str, Any]:
+    """Flat metadata keys: tc_source always, tc_<key> per header pair."""
+    metadata: Dict[str, Any] = {"tc_source": source}
+    for key, value in (effective or {}).items():
+        metadata[f"tc_{key}"] = value
+    return metadata
+
+
+def count_tc_sources(entries: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+    """Agents registered in this session so far, by where their header came
+    from. "unattributed" is an agent with no header of its own and none to
+    inherit; a reader shows that count rather than folding it into zero."""
+    counts = {"agents": 0, TC_SOURCE_OWN: 0, TC_SOURCE_INHERITED: 0, "unattributed": 0}
+    for entry in entries.values():
+        source = entry.get("tc_source") if isinstance(entry, dict) else None
+        if source not in (TC_SOURCE_OWN, TC_SOURCE_INHERITED, TC_SOURCE_NONE):
+            continue
+        counts["agents"] += 1
+        counts["unattributed" if source == TC_SOURCE_NONE else source] += 1
+    return counts
+
+def get_turn_tc_header(turn: Turn) -> Optional[Dict[str, str]]:
+    """The header of a main-thread turn's own prompt."""
+    return parse_tc_header(extract_text_from_content(get_content_from_row(turn.user_msg)))
+
+
+# Low-cardinality header keys that also become trace tags ("tc:migration=m1"),
+# so the Langfuse UI can filter traces by them. Per-agent keys (fqn, batch)
+# stay in observation metadata only.
+TC_TAG_KEYS = ("migration", "work")
+
+
+def collect_tc_tags(
+    turn: Turn,
+    subagent_transcripts_by_tool_use_id: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> List[str]:
+    """'tc:<key>=<value>' tags from the turn's own header and from the
+    headers of the agents it launched directly."""
+    headers: List[Dict[str, str]] = []
+    own = get_turn_tc_header(turn)
+    if own:
+        headers.append(own)
+    for assistant_message in turn.assistant_msgs:
+        for tool_use in get_tool_use_blocks(get_content_from_row(assistant_message)):
+            tool_use_id = str(tool_use.get("id") or "")
+            subagent = (subagent_transcripts_by_tool_use_id or {}).get(tool_use_id) if tool_use_id else None
+            if not isinstance(subagent, dict) or not isinstance(subagent.get("path"), Path):
+                continue
+            rows = read_subagent_jsonl(subagent["path"])
+            header = tc_header_from_rows(rows) if rows else None
+            if header:
+                headers.append(header)
+    tags: List[str] = []
+    for header in headers:
+        for key in TC_TAG_KEYS:
+            if header.get(key):
+                tag = f"tc:{key}={header[key]}"
+                if tag not in tags:
+                    tags.append(tag)
+    return tags
 
 # ---- Generation payloads ----
 def build_generation_input(
@@ -3580,6 +3748,16 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     }
     if extra_metadata:
         subagent_metadata.update(extra_metadata)
+    # The agent's own "[tc ...]" header from its full prompt, else the one in
+    # force where it was launched. A registered agent keeps what it inherited
+    # at first sight, since a refresh re-emits it outside its launcher.
+    if entry is not None and "tc_inherited" in entry:
+        tc_inherited = entry.get("tc_inherited") if isinstance(entry.get("tc_inherited"), dict) else None
+    else:
+        tc_inherited = _TC_CONTEXT.get()
+    tc_effective, tc_source = resolve_tc(tc_header_from_rows(rows) if TC_HEADERS else None, tc_inherited)
+    if TC_HEADERS:
+        subagent_metadata.update(tc_metadata(tc_effective, tc_source))
     span_kwargs: Dict[str, Any] = dict(
         name=span_name,
         as_type="span",
@@ -3641,7 +3819,7 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
     # main conversation.
     subagent_history: List[Dict[str, Any]] = []
     for turn_index, turn in enumerate(turns):
-        with id_scope(f"{agent_id}:{turn_index}"):
+        with id_scope(f"{agent_id}:{turn_index}"), tc_context(tc_effective):
             latest_turn_timestamp = emit_turn_observations(
                 langfuse,
                 children_parent,
@@ -3697,6 +3875,8 @@ def emit_subagent_observations(langfuse: Langfuse, parent_otel_span: Any,
             },
             "agent_type": subagent.get("agent_type"),
             "description": description,
+            "tc_inherited": tc_inherited,
+            "tc_source": tc_source,
         }
 
     return latest_end_timestamp
@@ -3945,11 +4125,14 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
     # scannable; the conversation history lives on the LLM call inputs.
     root_input = {"role": "user", "content": build_user_history_content(turn.user_msg)}
     trace_metadata = build_trace_metadata(session_id, turn_num, turn, transcript_path, user_text_meta)
+    if TC_HEADERS:
+        own = get_turn_tc_header(turn)
+        trace_metadata.update(tc_metadata(own, TC_SOURCE_OWN if own else TC_SOURCE_NONE))
     if parent_context is not None:
         parent_trace_id, parent_span_id = parent_context
         trace_metadata["parent_trace_id"] = parent_trace_id
         trace_metadata["parent_span_id"] = parent_span_id
-        return _start_backdated(
+        root = _start_backdated(
             langfuse,
             name="Conversational Turn",
             as_type="span",
@@ -3962,6 +4145,8 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
             metadata=trace_metadata,
             **get_status_kwargs(get_turn_status(turn)),
         )
+        _ROOT_METADATA[id(root)] = trace_metadata
+        return root
     # Opt-in deterministic trace ids: fail open to the carrier-derived id.
     forced_trace_id: Optional[str] = None
     if trace_seed:
@@ -3969,7 +4154,7 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
             forced_trace_id = derive_turn_trace_id(trace_seed, turn_num)
         except Exception as e:
             debug(f"trace id derivation failed for turn {turn_num}: {e}")
-    return _start_backdated(
+    root = _start_backdated(
         langfuse,
         name="Conversational Turn",
         as_type="span",
@@ -3982,6 +4167,25 @@ def open_turn_root_span(langfuse: Langfuse, session_id: str, turn_num: int, turn
         metadata=trace_metadata,
         **get_status_kwargs(get_turn_status(turn)),
     )
+    _ROOT_METADATA[id(root)] = trace_metadata
+    return root
+
+
+# Root span -> the metadata it was opened with, for the one update it gets
+# before it ends (the session's agent counts are known only then).
+_ROOT_METADATA: Dict[int, Dict[str, Any]] = {}
+
+
+def root_end_metadata(trace_span: Any) -> Optional[Dict[str, Any]]:
+    """The root's metadata plus tc_session_agents: every agent registered in
+    this session so far, by header source. Taken when the root ends, after
+    this turn's agents were emitted, so the latest root of a session carries
+    the session's count; None outside a firing with a registry."""
+    opened = _ROOT_METADATA.pop(id(trace_span), None)
+    registry = _ACTIVE_AGENT_REGISTRY.get()
+    if not TC_HEADERS or opened is None or registry is None:
+        return None
+    return {**opened, "tc_session_agents": count_tc_sources(registry.entries)}
 
 
 
@@ -4060,20 +4264,27 @@ def emit_turn(langfuse: Langfuse, session_id: str, turn_num: int,
                 root_span_id=root_span_id,
                 trace_id=progress.get("trace_id") or (parent_context[0] if parent_context else None),
             )
-        obs_end_ts = emit_turn_observations(
-            langfuse,
-            parent_otel_span,
-            turn,
-            parse_timestamp(turn.user_msg),
-            subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
-            cursor=cursor,
-            workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
-            history_prefix=history_prefix,
-        )
+        # A main-thread turn whose prompt carries a header hands it to every
+        # agent it launches; a turn without one hands down nothing.
+        with tc_context(get_turn_tc_header(turn) if TC_HEADERS else None):
+            obs_end_ts = emit_turn_observations(
+                langfuse,
+                parent_otel_span,
+                turn,
+                parse_timestamp(turn.user_msg),
+                subagent_transcripts_by_tool_use_id=subagent_transcripts_by_tool_use_id,
+                cursor=cursor,
+                workflow_agent_transcripts_by_run_id=workflow_agent_transcripts_by_run_id,
+                history_prefix=history_prefix,
+            )
         if trace_span is not None:
             # The root exports exactly once: end time and output are the
             # values known now, and stay — exported fields are immutable.
-            trace_span.update(output=build_turn_output_payload(turn))
+            end_metadata = root_end_metadata(trace_span)
+            trace_span.update(
+                output=build_turn_output_payload(turn),
+                **({"metadata": end_metadata} if end_metadata is not None else {}),
+            )
             trace_span.end(
                 end_time=to_otel_nanoseconds(get_root_span_end_time(turn, obs_end_ts))
             )
@@ -4440,6 +4651,7 @@ class _RecordedObservation:
         self.usage_details = kwargs.get("usage_details")
         metadata = kwargs.get("metadata") if isinstance(kwargs.get("metadata"), dict) else {}
         self.transcript_path = metadata.get("transcript_path") if as_type == "span" else None
+        self.tc_source = metadata.get("tc_source")
         recorder.record(self)
 
     def update(self, **kwargs: Any) -> None:
@@ -4763,6 +4975,15 @@ def run_backfill(argv: List[str]) -> int:
         summary.update({"session_id": session_id, "namespace": TRACE_SEED_NAMESPACE, "turns": turns,
                         "agent_spans": sum(1 for o in recorder.by_id.values()
                                            if o.as_type == "span" and o.name.startswith(("Subagent", "Workflow agent")))})
+        if TC_HEADERS:
+            # Where each agent's "[tc ...]" header would come from: check
+            # attribution coverage before uploading anything.
+            tc_sources: Dict[str, int] = {}
+            for o in recorder.by_id.values():
+                if o.as_type == "span" and o.name.startswith(("Subagent", "Workflow agent")):
+                    key = str(o.tc_source or TC_SOURCE_NONE)
+                    tc_sources[key] = tc_sources.get(key, 0) + 1
+            summary["agent_tc_sources"] = tc_sources
         if args.replace_session_traces:
             if existing is None:
                 summary["replace_plan"] = "not listed: no Langfuse keys in the environment"
