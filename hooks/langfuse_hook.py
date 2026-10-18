@@ -4183,7 +4183,9 @@ def root_end_metadata(trace_span: Any) -> Optional[Dict[str, Any]]:
     the session's count; None outside a firing with a registry."""
     opened = _ROOT_METADATA.pop(id(trace_span), None)
     registry = _ACTIVE_AGENT_REGISTRY.get()
-    if not TC_HEADERS or opened is None or registry is None:
+    # Without deterministic ids no agent is registered, and a count of zero
+    # would read as "no agents" rather than "not counted".
+    if not TC_HEADERS or not DETERMINISTIC_IDS or opened is None or registry is None:
         return None
     return {**opened, "tc_session_agents": count_tc_sources(registry.entries)}
 

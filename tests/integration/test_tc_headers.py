@@ -173,6 +173,20 @@ def test_trace_tags_name_the_turn_and_direct_agent_headers(hook_module, fixture_
     assert not any(t.startswith(("tc:batch=", "tc:fqn=", "tc:phase=")) for t in tags)
 
 
+def test_no_session_count_without_a_registry_to_count(hook_module, fake_langfuse, isolated_hook_state, fixture_transcript_path, tmp_path, monkeypatch):
+    # Without deterministic ids no agent is registered: the root says nothing
+    # rather than a count of zero that would read as "no agents".
+    monkeypatch.setattr(hook_module, "DETERMINISTIC_IDS", False)
+    transcript = copy_tc_fixture(fixture_transcript_path, tmp_path)
+    config = hook_module.LangfuseConfig("public", "secret", "https://example.test", "user-1")
+    hook_module.emit_new_turns_from_transcript(
+        fake_langfuse, config, "session-tc", transcript, flush_deferred_agent_turns=True
+    )
+    root = next(o for o in fake_langfuse.observations if o.name == "Conversational Turn")
+    assert "tc_session_agents" not in root.kwargs["metadata"]
+    assert tc_of(agent_span(fake_langfuse, "tc-inner"))["tc_source"] == "inherited"
+
+
 def test_option_off_lifts_nothing(hook_module, fake_langfuse, isolated_hook_state, fixture_transcript_path, tmp_path, monkeypatch):
     monkeypatch.setattr(hook_module, "TC_HEADERS", False)
     transcript = copy_tc_fixture(fixture_transcript_path, tmp_path)
