@@ -71,6 +71,40 @@ claude plugin update langfuse-observability@langfuse-observability
 Restart Claude Code afterwards. `claude plugin list` shows the installed
 version.
 
+A session that was already running keeps the hook version it started with,
+including a resumed one: the update reaches it only after a restart. Since
+1.2.2 every firing writes `langfuse_agents.<key>.json` beside the state file
+(`~/.claude/state` by default), so a state directory with no such file has not
+run 1.2.2 or later yet.
+
+## Prompt headers
+
+A launcher can start an agent's prompt with one line that says what the work
+is for:
+
+```text
+[tc migration=m1 batch=b2 fqn=pkg.a:svc phase=codegen]
+```
+
+The hook reads it from the agent's full prompt, not from the span input,
+which is truncated to `CC_LANGFUSE_MAX_CHARS`. It counts on the first non-blank
+line, or on any line that begins with it in the first 4000 characters. A
+workflow agent's computed task is read before the relayed user request above
+it.
+
+- Each pair becomes `tc_<key>` in the agent span's metadata. Empty values
+  (`pr=`) are dropped.
+- `tc_source` says where they came from: `own`, `inherited` (from the agent
+  or main-thread turn that launched it, at any depth, workflow agents
+  included), or `none`. An own header replaces the inherited one whole.
+- A main-thread turn whose prompt has a header carries it on its root span.
+  The root also gets `tc_session_agents` when it ends: the session's agents
+  so far by source, with `unattributed` for those with no header to own or
+  inherit.
+- `migration` and `work` also become trace tags (`tc:migration=m1`).
+
+Set `CC_LANGFUSE_TC_HEADERS=false` to turn this off.
+
 ## Backfilling a past session
 
 The hook can re-upload a finished session from its transcript, for example

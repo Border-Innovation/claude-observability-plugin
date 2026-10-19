@@ -1,0 +1,1 @@
+{"agentType": "fix-codegen-agent", "description": "Fix-codegen svcA", "toolUseId": "toolu_01UeZexoKQJUmHskT7JHUrue", "spawnDepth": 2, "requestShape": "background", "parentAgentId": "tc-outer"}
